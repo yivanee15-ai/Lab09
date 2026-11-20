@@ -21,13 +21,15 @@ module QME (input logic clk, INF.QME inf);
     nib = c[27 - 4*s -: 4];
   endfunction
   function automatic [3:0] pairidx(input [1:0] h, input [1:0] a);
-    pairidx = {2'b00, h} * 4'd3 + ((a < h) ? {2'b00, a} : ({2'b00, a} - 4'd1));
+    pairidx = {1'b0, h, 1'b0} + {2'b00, h} + ((a < h) ? {2'b00, a} : ({2'b00, a} - 4'd1));   // 3*h + ...
   endfunction
   function automatic [8:0] cum_f(input [3:0] m);          // days before month m (non leap year)
     logic [8:0] a;
+    logic [3:0] kk;
     logic [4:0] sub;
     begin
-      a   = ({5'd0, m} - 9'd1) * 9'd31;
+      kk  = m - 4'd1;
+      a   = ({kk, 5'd0}) - {4'd0, kk};          // 31 * (m - 1)
       sub = (m <= 4'd2) ? 5'd0 : (m <= 4'd8) ? ({1'b0, m} + 5'd3) >> 1 : ({1'b0, m} + 5'd2) >> 1;
       cum_f = a - {4'd0, sub};
     end
@@ -86,7 +88,7 @@ module QME (input logic clk, INF.QME inf);
   logic [7:0] r1r, r2r;
   logic [9:0] d365_r;
   logic [7:0] seed_c;
-  always_comb begin
+  always_comb begin : blk_1
     logic [7:0] s0;
     s0 = doy_t[7:0] ^ {6'b0, tm1} ^ {4'b0, tm2, 2'b0};
     seed_c = (s0 == 8'd0) ? 8'd1 : s0;
@@ -143,7 +145,7 @@ module QME (input logic clk, INF.QME inf);
   wire [2:0]  idxA = ri[2:0] - 3'd1;
   logic [16:0] addr_reg;
   logic [13:0] n_oh;
-  always_comb begin
+  always_comb begin : blk_2
     logic [3:0] pidr;
     logic [1:0] tmr;
     pidr = need_A ? nib(cA, idxA) : nib(cH, idxH);
@@ -256,7 +258,7 @@ module QME (input logic clk, INF.QME inf);
   wire  [16:0] t2_n = {1'b0, ld_val[31:16]} + {1'b0, ls_val[15:0]};    // option 2 : (K2, X)
   logic       ksok_n;
   logic [3:0] rK_n, rS_n;
-  always_comb begin
+  always_comb begin : blk_3
     logic eq, o1, o2, pick1;
     eq    = (ld_id[3:0] == ls_id[3:0]);
     o1    = ls_v[1];
@@ -273,7 +275,7 @@ module QME (input logic clk, INF.QME inf);
     for (int i = 0; i < 4; i++) av_d[i] = ld_v[i] & (ld_id[4*i +: 4] != rK) & (ld_id[4*i +: 4] != rS);
   end
   logic [3:0] rB0_n, rB1_n;
-  always_ff @(posedge clk) bok <= (av_d[0] + av_d[1] + av_d[2] + av_d[3]) >= 3'd2;
+  always_ff @(posedge clk) bok <= ({2'b00, av_d[0]} + {2'b00, av_d[1]} + {2'b00, av_d[2]} + {2'b00, av_d[3]}) >= 3'd2;
   always_comb begin
     if (av_d[0]) begin
       rB0_n = ld_id[3:0];
@@ -288,7 +290,7 @@ module QME (input logic clk, INF.QME inf);
   logic [6:0] av_a;
   logic       cok_c;
   logic [3:0] c0n, c1n, c2n;
-  always_comb begin
+  always_comb begin : blk_4
     logic [2:0] k;
     for (int i = 0; i < 7; i++)
       av_a[i] = la_v[i] & (la_id[4*i +: 4] != rK) & (la_id[4*i +: 4] != rS) &
@@ -320,7 +322,7 @@ module QME (input logic clk, INF.QME inf);
   logic        c0_r, c1_r, ca_r;
   // S2
   logic [3:0]  gH_r, gA_r;
-  always_ff @(posedge clk) begin
+  always_ff @(posedge clk) begin : blk_5
     logic [17:0] sAH, sDH, sAA, sDA, y0, y1, ya;
     pAH <= {1'b0, pmA[16*1 +: 16]} + {1'b0, pmA[16*2 +: 16]};
     pDH <= {1'b0, pmD[16*0 +: 16]} + {1'b0, pmD[16*4 +: 16]};
@@ -341,13 +343,14 @@ module QME (input logic clk, INF.QME inf);
   end
   logic [3:0] qaH, qaA;
   logic [1:0] qdH, qdA;
-  always_comb begin
+  always_comb begin : blk_6
     logic [10:0] m1, m2;
     logic [8:0]  m3, m4;
-    m1 = {5'd0, qaH6} * 11'd43; qaH = m1[10:7];
-    m2 = {5'd0, qaA6} * 11'd43; qaA = m2[10:7];
-    m3 = {5'd0, qdH4} * 9'd43;  qdH = m3[8:7];
-    m4 = {5'd0, qdA4} * 9'd43;  qdA = m4[8:7];
+    // floor(x / 3) = (43 * x) >> 7 for the small ranges used here (43 = 32 + 8 + 2 + 1)
+    m1 = {qaH6, 5'd0} + {2'd0, qaH6, 3'd0} + {4'd0, qaH6, 1'b0} + {5'd0, qaH6}; qaH = m1[10:7];
+    m2 = {qaA6, 5'd0} + {2'd0, qaA6, 3'd0} + {4'd0, qaA6, 1'b0} + {5'd0, qaA6}; qaA = m2[10:7];
+    m3 = {qdH4, 5'd0} + {2'd0, qdH4, 3'd0} + {4'd0, qdH4, 1'b0} + {5'd0, qdH4}; qdH = m3[8:7];
+    m4 = {qdA4, 5'd0} + {2'd0, qdA4, 3'd0} + {4'd0, qdA4, 1'b0} + {5'd0, qdA4}; qdA = m4[8:7];
   end
   always_ff @(posedge clk) begin
     gH_r <= (qaH > {2'b0, qdA}) ? qaH - {2'b0, qdA} : 4'd0;
@@ -385,7 +388,7 @@ module QME (input logic clk, INF.QME inf);
     cr = {(x[16:0] & y[16:0]) | (x[16:0] & z[16:0]) | (y[16:0] & z[16:0]), cin};
     add3 = sm + cr;
   endfunction
-  always_comb begin
+  always_comb begin : blk_7
     logic [15:0] a, d, s;
     logic [17:0] sum;
     logic        c_ad, c_as, c_ds;
@@ -395,7 +398,7 @@ module QME (input logic clk, INF.QME inf);
     c_ad = (a <= d); c_as = (a <= s); c_ds = (d <= s);          // "x precedes y" in the stable ascending order A, D, S
     fad = d - a; fda = a - d; fas = s - a; fsa = a - s; fds = s - d; fsd = d - s;
     case (opt[3:2])
-      2'd0: begin dA_n = sum[17:3]; dD_n = sum[17:3]; dS_n = sum[17:3]; end
+      2'd0: begin dA_n = {1'b0, sum[17:3]}; dD_n = {1'b0, sum[17:3]}; dS_n = {1'b0, sum[17:3]}; end
       2'd1: begin
         // delta(x) = (next higher attribute) - x ; the highest one gets 0
         dA_n = (c_ad & c_as) ? (c_ds ? fad : fas) : (~c_ad & ~c_as) ? 16'd0 : (c_ad ? fad : fas);
@@ -415,7 +418,7 @@ module QME (input logic clk, INF.QME inf);
     endcase
   end
   // T2 : value + delta + scale correction (easy: -(delta>>2), hard: +(delta>>2))
-  always_comb begin
+  always_comb begin : blk_8
     logic [17:0] ea, ed, es;
     logic        cin;
     cin = (opt[1:0] == 2'd0);
@@ -437,7 +440,7 @@ module QME (input logic clk, INF.QME inf);
   logic [3:0]  wsel;                          // profile entry of the next Match profile beat
   logic [63:0] ud;
   logic        usat_c;
-  always_comb begin
+  always_comb begin : blk_9
     logic win, los, u_home;
     logic [15:0] uA, uD, uS, uE;
     logic [16:0] ra, rd_, rs, re;
@@ -646,7 +649,7 @@ module QME (input logic clk, INF.QME inf);
       tg2 <= tg1;
       if (tg2) t_ok <= 1'b1;
       qg1 <= l_pair; qg2 <= qg1;
-      begin
+      begin : blk_10
         logic [2:0] cdd;
         cdd = (cd != 3'd0) ? cd - 3'd1 : 3'd0;
         cd <= (l_profm && is_match && dm1 > cdd) ? dm1 : cdd;
