@@ -10,3 +10,77 @@ min  PASS total_latency=25660 (avg 25.66/cmd)  build 29.0  train 13.1  match 47.
 mid  PASS total_latency=53303 (avg 53.30/cmd)  build 41.6  train 27.0  match 109.7  query 10.4
 max  PASS total_latency=322521 (avg 322.52/cmd)  build 201.1  train 165.1  match 691.7  query 60.7
 [synth]
+toy45: area=36548.134000 um2  flops=1510
+reg2reg  worst=25.839 ns -> T>=25.839 ns
+in2reg   worst=0.933 ns -> T>=1.866 ns
+reg2out  worst=0.117 ns -> T>=0.233 ns
+T_min(estimate, toy45) = 25.839 ns
+##### v2
+[regress 12 seeds x 4 DRAM configs]
+--- runs: 48  PASS: 48  not-pass: 0
+[fuzz]
+--- fuzz runs: 60  PASS: 60  of 60
+[directed]
+RESULT   PASS errors=0 cmds=16 total_latency=239 avg=14.94 max=36 | build=130/5 train=20/4 match=73/3 query=16/4
+[bench]
+min  PASS total_latency=18903 (avg 18.90/cmd)  build 26.0  train 7.4  match 34.2  query 4.6
+mid  PASS total_latency=44784 (avg 44.78/cmd)  build 38.9  train 20.9  match 91.1  query 9.8
+max  PASS total_latency=308557 (avg 308.56/cmd)  build 190.4  train 163.4  match 658.4  query 56.9
+[synth]
+toy45: area=21169.610000 um2  flops=1851
+reg2reg  worst=1.329 ns -> T>=1.329 ns
+in2reg   worst=0.971 ns -> T>=1.942 ns
+reg2out  worst=0.406 ns -> T>=0.813 ns
+T_min(estimate, toy45) = 1.942 ns
+##### v3
+[regress 12 seeds x 4 DRAM configs]
+--- runs: 48  PASS: 48  not-pass: 0
+[fuzz]
+--- fuzz runs: 60  PASS: 60  of 60
+[directed]
+RESULT   PASS errors=0 cmds=16 total_latency=254 avg=15.88 max=37 | build=136/5 train=24/4 match=75/3 query=19/4
+[bench]
+min  PASS total_latency=19873 (avg 19.87/cmd)  build 26.0  train 9.0  match 35.1  query 5.5
+mid  PASS total_latency=46745 (avg 46.74/cmd)  build 39.2  train 23.0  match 94.7  query 10.4
+max  PASS total_latency=310127 (avg 310.13/cmd)  build 197.3  train 158.1  match 662.1  query 60.8
+[synth]
+toy45: area=21522.858000 um2  flops=1985
+reg2reg  worst=1.244 ns -> T>=1.244 ns
+in2reg   worst=0.664 ns -> T>=1.327 ns
+reg2out  worst=0.233 ns -> T>=0.466 ns
+T_min(estimate, toy45) = 1.327 ns
+##### v4
+[regress 12 seeds x 4 DRAM configs]
+--- runs: 48  PASS: 48  not-pass: 0
+[fuzz]
+--- fuzz runs: 60  PASS: 60  of 60
+[directed]
+RESULT   PASS errors=0 cmds=16 total_latency=254 avg=15.88 max=37 | build=136/5 train=24/4 match=75/3 query=19/4
+[bench]
+min  PASS total_latency=19873 (avg 19.87/cmd)  build 26.0  train 9.0  match 35.1  query 5.5
+mid  PASS total_latency=46745 (avg 46.74/cmd)  build 39.2  train 23.0  match 94.7  query 10.4
+max  PASS total_latency=310127 (avg 310.13/cmd)  build 197.3  train 158.1  match 662.1  query 60.8
+[synth]
+toy45: area=18348.946000 um2  flops=1461
+reg2reg  worst=1.411 ns -> T>=1.411 ns
+in2reg   worst=0.687 ns -> T>=1.373 ns
+reg2out  worst=0.233 ns -> T>=0.466 ns
+T_min(estimate, toy45) = 1.411 ns
+##### v5
+[regress 12 seeds x 4 DRAM configs]
+--- runs: 48  PASS: 48  not-pass: 0
+[fuzz]
+--- fuzz runs: 60  PASS: 60  of 60
+[directed]
+RESULT   PASS errors=0 cmds=16 total_latency=247 avg=15.44 max=36 | build=136/5 train=22/4 match=73/3 query=16/4
+[bench]
+min  PASS total_latency=19137 (avg 19.14/cmd)  build 26.0  train 8.2  match 34.2  query 4.6
+mid  PASS total_latency=45929 (avg 45.93/cmd)  build 38.7  train 22.0  match 93.8  query 9.6
+max  PASS total_latency=310144 (avg 310.14/cmd)  build 190.4  train 158.7  match 665.4  query 60.7
+[synth]
+toy45: area=18037.194000 um2  flops=1396
+reg2reg  worst=1.415 ns -> T>=1.415 ns
+in2reg   worst=0.725 ns -> T>=1.450 ns
+reg2out  worst=0.512 ns -> T>=1.025 ns
+T_min(estimate, toy45) = 1.450 ns
+done
