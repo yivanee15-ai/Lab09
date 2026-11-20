@@ -90,5 +90,11 @@ for k in res:
         if key in seen: continue
         seen.add(key)
         print("    %.3f  %s -> %s  (levels=%d)" % (t, base(path[0]), end, len(path) - 1))
+        if os.environ.get("STA_PATH") and len(seen) == 1:
+            drv = {g[3]: (g[1], g[2]) for g in gates}
+            line = []
+            for n in path[1:]:
+                if n in drv: line.append("%s(fo%d)" % (drv[n][0].replace("_X1", ""), fanout.get(n, 1)))
+            print("      path: " + " > ".join(line))
         if len(seen) >= TOP: break
 print("T_min(estimate, toy45) = %.3f ns" % max(tmin.values()))
