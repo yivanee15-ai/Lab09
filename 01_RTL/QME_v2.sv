@@ -1,0 +1,632 @@
+// QME v2 : latency / cycle-time oriented.
+//  * first AR is loaded in the very cycle the last input valid is sampled (address taken from D)
+//  * ID is re-used the cycle after R_LAST, AW/W/B engines are overlapped, out_valid is set in the
+//    cycle the last B response is sampled
+//  * Build Team : candidates are inserted into sorted top-N lists while the beats arrive
+//  * Match      : derived values (sums, catch, goals) are free-running pipeline registers on the
+//                 profile store, so the result is ready 2..3 cycles after the last profile lands
+//  * Match writes: pair record first, then the 14 profiles through a select -> update pipeline
+//  * Training   : 2 compute stages, AW is issued as soon as the profile landed and Exp is sufficient
+module QME (input logic clk, INF.QME inf);
+
+  localparam [2:0] W_NONE = 3'b000, W_DATE = 3'b001, W_TEAM = 3'b010, W_ROSTER = 3'b011,
+                   W_OPT = 3'b100, W_EXP = 3'b101, W_SAT = 3'b111;
+  localparam [1:0] A_BUILD = 2'd0, A_TRAIN = 2'd1, A_MATCH = 2'd2, A_QUERY = 2'd3;
+
+  // =============================================================== helper functions
+  function automatic [3:0] nib(input [27:0] c, input [2:0] s);
+    nib = c[27 - 4*s -: 4];
+  endfunction
+  function automatic [3:0] pairidx(input [1:0] h, input [1:0] a);
+    pairidx = {2'b00, h} * 4'd3 + ((a < h) ? {2'b00, a} : ({2'b00, a} - 4'd1));
+  endfunction
+  // days before month m (non leap year), pure arithmetic (no table)
+  function automatic [8:0] cum_f(input [3:0] m);
+    logic [8:0] a;
+    logic [4:0] sub;
+    begin
+      a   = ({5'd0, m} - 9'd1) * 9'd31;
+      sub = (m <= 4'd2) ? 5'd0 : (m <= 4'd8) ? ({1'b0, m} + 5'd3) >> 1 : ({1'b0, m} + 5'd2) >> 1;
+      cum_f = a - {4'd0, sub};
+    end
+  endfunction
+  function automatic [8:0] doy_f(input [3:0] m, input [4:0] d);
+    doy_f = cum_f(m) + {4'd0, d};
+  endfunction
+  function automatic [7:0] lfsr(input [7:0] x);
+    lfsr = {x[6:0], x[7] ^ x[5] ^ x[4] ^ x[3]};
+  endfunction
+  // saturating +2048 / -2048 / -1024 (flag = a clamp really happened)
+  function automatic [16:0] inc2048(input [15:0] v);
+    inc2048 = (&v[15:11]) ? {1'b1, 16'hFFFF} : {1'b0, v[15:11] + 5'd1, v[10:0]};
+  endfunction
+  function automatic [16:0] dec2048(input [15:0] v);
+    dec2048 = (~|v[15:11]) ? {1'b1, 16'h0000} : {1'b0, v[15:11] - 5'd1, v[10:0]};
+  endfunction
+  function automatic [16:0] dec1024(input [15:0] v);
+    dec1024 = (~|v[15:10]) ? {1'b1, 16'h0000} : {1'b0, v[15:10] - 6'd1, v[9:0]};
+  endfunction
+
+  // =============================================================== input capture
+  logic [1:0] act, tm1, tm2;
+  logic [3:0] month;
+  logic [4:0] day;
+  logic [6:0] opt;
+  logic       got_t1;
+
+  wire lastv_team   = inf.in_valid_team && ((act == A_BUILD) || (got_t1 && act[1]));
+  wire lastv_option = inf.in_valid_option;
+  wire lastv        = lastv_team || lastv_option;
+  wire early_team   = lastv_team && act[1] && (inf.D[1:0] == tm1);
+  wire early_opt    = lastv_option && ((inf.D[6:4] == 3'd7) || (inf.D[1:0] == 2'd3));
+  wire early        = early_team | early_opt;
+  wire start        = lastv & ~early;
+
+  always_ff @(posedge clk or negedge inf.rst_n) begin
+    if (!inf.rst_n) begin
+      act <= '0; tm1 <= '0; tm2 <= '0; month <= '0; day <= '0; opt <= '0; got_t1 <= 1'b0;
+    end else begin
+      if (inf.in_valid_action) begin act <= inf.D[1:0]; got_t1 <= 1'b0; end
+      if (inf.in_valid_date) begin month <= inf.D[8:5]; day <= inf.D[4:0]; end
+      if (inf.in_valid_team) begin
+        if (!got_t1) tm1 <= inf.D[1:0]; else tm2 <= inf.D[1:0];
+        got_t1 <= ~got_t1;
+      end
+      if (inf.in_valid_option) opt <= inf.D[6:0];
+    end
+  end
+
+  // free-running date derived values (inputs are static long before they are needed)
+  logic [8:0] doy_t;
+  logic [7:0] r1r, r2r;
+  logic [9:0] lo_r, wr_r, d365_r;
+  logic [7:0] seed_c;
+  always_comb begin
+    logic [7:0] s0;
+    s0 = doy_t[7:0] ^ {6'b0, tm1} ^ {4'b0, tm2, 2'b0};
+    seed_c = (s0 == 8'd0) ? 8'd1 : s0;
+  end
+  always_ff @(posedge clk) begin
+    doy_t  <= doy_f(month, day);
+    r1r    <= lfsr(seed_c);
+    r2r    <= lfsr(lfsr(seed_c));
+    lo_r   <= {1'b0, doy_t} - 10'd90;   // doy - 90 (signed)
+    wr_r   <= {1'b0, doy_t} + 10'd275;
+    d365_r <= {1'b0, doy_t} + 10'd365;
+  end
+
+  // =============================================================== command control
+  logic        run;
+  logic [4:0]  ri, rl;                       // reads issued / landed
+  wire  [4:0]  nrd = (act == A_BUILD) ? 5'd4 : (act == A_TRAIN) ? 5'd2 : (act == A_MATCH) ? 5'd16 : 5'd1;
+  wire  [4:0]  nwr = (act == A_MATCH) ? 5'd15 : 5'd1;
+
+  // ---- AR channel / read tracking
+  logic        ar_valid;
+  logic [1:0]  ar_id;
+  logic [16:0] ar_addr;
+  logic [3:0]  rbusy;
+  logic [19:0] rtag;
+  logic [1:0]  rbeat;
+  logic        rdy;
+  logic [27:0] cH, cA;
+  logic        hH, hA;
+
+  wire [4:0]  rtag_cur = rtag[5*inf.R_ID +: 5];
+  wire        r_last   = inf.R_VALID & inf.R_LAST;
+  wire        drained_now = r_last & (rl == nrd - 5'd1);
+  wire        land_ctxH = inf.R_VALID & ((act == A_MATCH) | (act == A_TRAIN)) & (rtag_cur == 5'd0);
+  wire        land_ctxA = inf.R_VALID & (act == A_MATCH) & (rtag_cur == 5'd1);
+  wire        land_prof = inf.R_VALID & (((act == A_MATCH) & (rtag_cur >= 5'd2)) | ((act == A_TRAIN) & (rtag_cur == 5'd1)));
+  wire        land_pair = inf.R_VALID & (act == A_QUERY);
+  wire        land_bld  = inf.R_VALID & (act == A_BUILD);
+
+  wire [3:0]  rfree_now = ~rbusy | ({4{r_last}} & (4'b0001 << inf.R_ID));
+  wire        r_any     = |rfree_now;
+  wire [1:0]  r_newid   = rfree_now[0] ? 2'd0 : rfree_now[1] ? 2'd1 : rfree_now[2] ? 2'd2 : 2'd3;
+
+  wire [27:0] viewH = land_ctxH ? inf.R_DATA[127:100] : cH;
+  wire [27:0] viewA = land_ctxA ? inf.R_DATA[127:100] : cA;
+  logic       dep_ok;
+  logic [3:0] n_pid;
+  logic [1:0] n_team;
+  logic [16:0] addr_run;
+  always_comb begin
+    dep_ok = 1'b1; n_pid = 4'd0; n_team = tm1;
+    case (act)
+      A_TRAIN: begin
+        dep_ok = hH | land_ctxH; n_pid = nib(viewH, opt[6:4]);
+      end
+      A_MATCH: begin
+        if (ri < 5'd2) dep_ok = 1'b1;
+        else if (ri < 5'd9) begin dep_ok = hH | land_ctxH; n_pid = nib(viewH, ri[2:0] - 3'd2); end
+        else begin dep_ok = hA | land_ctxA; n_pid = nib(viewA, ri[2:0] - 3'd1); n_team = tm2; end
+      end
+      default: ;
+    endcase
+    // address of read #ri (run phase)
+    case (act)
+      A_BUILD: addr_run = {7'b1000000, tm1, ri[1:0], 6'd0};
+      A_TRAIN: addr_run = (ri == 5'd0) ? {1'b1, 5'd0, 1'b1, 1'b0, 1'b1, 2'b00, tm1, 4'd0}
+                                       : {7'b1000000, tm1, n_pid, 4'd0};
+      A_MATCH: addr_run = (ri == 5'd0) ? {1'b1, 5'd0, 1'b1, 1'b0, 1'b1, 2'b00, tm1, 4'd0} :
+                          (ri == 5'd1) ? {1'b1, 5'd0, 1'b1, 1'b0, 1'b1, 2'b00, tm2, 4'd0} :
+                                         {7'b1000000, n_team, n_pid, 4'd0};
+      default: addr_run = {1'b1, 4'd0, 1'b1, 3'd0, pairidx(tm1, tm2), 4'd0};
+    endcase
+  end
+  // address of read #0 (loaded in the cycle of the last input valid, last team comes from D)
+  wire [16:0] addr0 = (act == A_BUILD) ? {7'b1000000, inf.D[1:0], 2'b00, 6'd0} :
+                      (act == A_QUERY) ? {1'b1, 4'd0, 1'b1, 3'd0, pairidx(tm1, inf.D[1:0]), 4'd0} :
+                                         {1'b1, 5'd0, 1'b1, 1'b0, 1'b1, 2'b00, tm1, 4'd0};
+
+  wire ar_more     = run & (ri < nrd);
+  wire ar_load_run = ar_more & (~ar_valid | inf.AR_READY) & dep_ok & r_any;
+  wire ar_load     = start | ar_load_run;
+
+  // =============================================================== storage
+  logic [223:0] pmA, pmD, pmS, pmE;          // 14 x 16 bit profile store (Training uses entry 0)
+  wire  [3:0]   ent = (act == A_MATCH) ? (rtag_cur[3:0] - 4'd2) : 4'd0;
+
+  // Query record
+  logic [1:0] pr_res; logic [3:0] pr_mon; logic [4:0] pr_day; logic [8:0] pr_sh, pr_sa;
+  logic       qg, qg2;
+  logic [8:0] rec_doy;
+
+  // Build capture + lists
+  logic [15:0] bc_a, bc_d, bc_s;
+  logic [3:0]  bc_pid;
+  logic        bc_vld;
+  logic [4:0]  bsh;
+  logic [3:0]  ld_v;  logic [63:0] ld_val; logic [15:0] ld_id;   // QD top 4 by defense
+  logic [1:0]  ls_v;  logic [31:0] ls_val; logic [7:0]  ls_id;   // QS top 2 by speed
+  logic [6:0]  la_v;  logic [111:0] la_val; logic [27:0] la_id;  // QA top 7 by attack
+
+  // =============================================================== Build : list insertion
+  wire ins_d = bc_vld & (|bc_d[15:12]);
+  wire ins_s = bc_vld & (|bc_s[15:12]);
+  wire ins_a = bc_vld & (|bc_a[15:12]);
+  logic [3:0]  ld_b;  logic [3:0]  ld_v_n;  logic [63:0] ld_val_n;  logic [15:0] ld_id_n;
+  logic [1:0]  ls_b;  logic [1:0]  ls_v_n;  logic [31:0] ls_val_n;  logic [7:0]  ls_id_n;
+  logic [6:0]  la_b;  logic [6:0]  la_v_n;  logic [111:0] la_val_n; logic [27:0] la_id_n;
+  always_comb begin
+    for (int i = 0; i < 4; i++)
+      ld_b[i] = ins_d & (~ld_v[i] | (bc_d > ld_val[16*i +: 16]) | ((bc_d == ld_val[16*i +: 16]) & (bc_pid < ld_id[4*i +: 4])));
+    for (int i = 0; i < 4; i++) begin
+      if (!ld_b[i]) begin ld_v_n[i] = ld_v[i]; ld_val_n[16*i +: 16] = ld_val[16*i +: 16]; ld_id_n[4*i +: 4] = ld_id[4*i +: 4]; end
+      else if (i == 0 || !ld_b[(i == 0) ? 0 : i - 1]) begin ld_v_n[i] = 1'b1; ld_val_n[16*i +: 16] = bc_d; ld_id_n[4*i +: 4] = bc_pid; end
+      else begin ld_v_n[i] = ld_v[(i == 0) ? 0 : i - 1]; ld_val_n[16*i +: 16] = ld_val[16*((i == 0) ? 0 : i - 1) +: 16]; ld_id_n[4*i +: 4] = ld_id[4*((i == 0) ? 0 : i - 1) +: 4]; end
+    end
+    for (int i = 0; i < 2; i++)
+      ls_b[i] = ins_s & (~ls_v[i] | (bc_s > ls_val[16*i +: 16]) | ((bc_s == ls_val[16*i +: 16]) & (bc_pid < ls_id[4*i +: 4])));
+    for (int i = 0; i < 2; i++) begin
+      if (!ls_b[i]) begin ls_v_n[i] = ls_v[i]; ls_val_n[16*i +: 16] = ls_val[16*i +: 16]; ls_id_n[4*i +: 4] = ls_id[4*i +: 4]; end
+      else if (i == 0 || !ls_b[(i == 0) ? 0 : i - 1]) begin ls_v_n[i] = 1'b1; ls_val_n[16*i +: 16] = bc_s; ls_id_n[4*i +: 4] = bc_pid; end
+      else begin ls_v_n[i] = ls_v[(i == 0) ? 0 : i - 1]; ls_val_n[16*i +: 16] = ls_val[16*((i == 0) ? 0 : i - 1) +: 16]; ls_id_n[4*i +: 4] = ls_id[4*((i == 0) ? 0 : i - 1) +: 4]; end
+    end
+    for (int i = 0; i < 7; i++)
+      la_b[i] = ins_a & (~la_v[i] | (bc_a > la_val[16*i +: 16]) | ((bc_a == la_val[16*i +: 16]) & (bc_pid < la_id[4*i +: 4])));
+    for (int i = 0; i < 7; i++) begin
+      if (!la_b[i]) begin la_v_n[i] = la_v[i]; la_val_n[16*i +: 16] = la_val[16*i +: 16]; la_id_n[4*i +: 4] = la_id[4*i +: 4]; end
+      else if (i == 0 || !la_b[(i == 0) ? 0 : i - 1]) begin la_v_n[i] = 1'b1; la_val_n[16*i +: 16] = bc_a; la_id_n[4*i +: 4] = bc_pid; end
+      else begin la_v_n[i] = la_v[(i == 0) ? 0 : i - 1]; la_val_n[16*i +: 16] = la_val[16*((i == 0) ? 0 : i - 1) +: 16]; la_id_n[4*i +: 4] = la_id[4*((i == 0) ? 0 : i - 1) +: 4]; end
+    end
+  end
+
+  // =============================================================== Build : final selection stages
+  logic [16:0] t1r, t2r;
+  logic [3:0]  rK, rS, rB0, rB1, rC0, rC1, rC2;
+  logic        ksok, bok;
+  // F1
+  always_ff @(posedge clk) begin
+    t1r <= {1'b0, ld_val[15:0]}  + {1'b0, ls_val[31:16]};   // option 1 : (X, S2)
+    t2r <= {1'b0, ld_val[31:16]} + {1'b0, ls_val[15:0]};    // option 2 : (K2, X)
+  end
+  // F2 : keeper / seeker
+  always_ff @(posedge clk) begin
+    logic eq, o1, o2, pick1;
+    eq    = (ld_id[3:0] == ls_id[3:0]);
+    o1    = ls_v[1];
+    o2    = ld_v[1];
+    pick1 = o1 & (~o2 | (t1r > t2r) | ((t1r == t2r) & (ld_id[3:0] < ld_id[7:4])));
+    ksok <= ld_v[0] & ls_v[0] & (~eq | o1 | o2);
+    if (!eq) begin rK <= ld_id[3:0]; rS <= ls_id[3:0]; end
+    else if (pick1) begin rK <= ld_id[3:0]; rS <= ls_id[7:4]; end
+    else begin rK <= ld_id[7:4]; rS <= ls_id[3:0]; end
+  end
+  // F3 : beaters (two best defenders that are neither K nor S)
+  logic [3:0] av_d;
+  always_comb begin
+    for (int i = 0; i < 4; i++) av_d[i] = ld_v[i] & (ld_id[4*i +: 4] != rK) & (ld_id[4*i +: 4] != rS);
+  end
+  always_ff @(posedge clk) begin
+    bok <= (av_d[0] + av_d[1] + av_d[2] + av_d[3]) >= 3'd2;
+    if (av_d[0]) begin
+      rB0 <= ld_id[3:0];
+      rB1 <= av_d[1] ? ld_id[7:4] : av_d[2] ? ld_id[11:8] : ld_id[15:12];
+    end else if (av_d[1]) begin
+      rB0 <= ld_id[7:4];
+      rB1 <= av_d[2] ? ld_id[11:8] : ld_id[15:12];
+    end else begin
+      rB0 <= ld_id[11:8]; rB1 <= ld_id[15:12];
+    end
+  end
+  // F4 : chasers (three best attackers not already chosen)
+  logic [6:0] av_a;
+  logic       cok_c;
+  logic [3:0] c0n, c1n, c2n;
+  always_comb begin
+    logic [2:0] cnt;
+    logic [2:0] k;
+    for (int i = 0; i < 7; i++)
+      av_a[i] = la_v[i] & (la_id[4*i +: 4] != rK) & (la_id[4*i +: 4] != rS) &
+                (la_id[4*i +: 4] != rB0) & (la_id[4*i +: 4] != rB1);
+    c0n = 4'd0; c1n = 4'd0; c2n = 4'd0; k = 3'd0;
+    for (int i = 0; i < 7; i++) begin
+      if (av_a[i]) begin
+        if (k == 3'd0) c0n = la_id[4*i +: 4];
+        else if (k == 3'd1) c1n = la_id[4*i +: 4];
+        else if (k == 3'd2) c2n = la_id[4*i +: 4];
+        k = k + 3'd1;
+      end
+    end
+    cok_c = (k >= 3'd3);
+  end
+  always_ff @(posedge clk) begin rC0 <= c0n; rC1 <= c1n; rC2 <= c2n; end
+  wire bld_valid_c = ksok & bok & cok_c;
+
+  // =============================================================== Match : free-running derived pipeline
+  logic [5:0] qaH6, qaA6;
+  logic [3:0] qdH4, qdA4;
+  logic       ch_r, ca_r;
+  logic [3:0] gH_r, gA_r;
+  always_ff @(posedge clk) begin
+    logic [17:0] sAH, sDH, sAA, sDA, y0, y1, ya;
+    sAH = {2'b0, pmA[16*1 +: 16]} + {2'b0, pmA[16*2 +: 16]} + {2'b0, pmA[16*3 +: 16]};
+    sDH = {2'b0, pmD[16*0 +: 16]} + {2'b0, pmD[16*4 +: 16]} + {2'b0, pmD[16*5 +: 16]};
+    sAA = {2'b0, pmA[16*8 +: 16]} + {2'b0, pmA[16*9 +: 16]} + {2'b0, pmA[16*10 +: 16]};
+    sDA = {2'b0, pmD[16*7 +: 16]} + {2'b0, pmD[16*11 +: 16]} + {2'b0, pmD[16*12 +: 16]};
+    qaH6 <= sAH[17:12]; qdH4 <= sDH[17:14]; qaA6 <= sAA[17:12]; qdA4 <= sDA[17:14];
+    y0 = {3'b0, pmS[16*6+1 +: 15]} + {2'b0, r1r, 8'd0} - {4'b0, pmS[16*11+2 +: 14]};
+    y1 = {3'b0, pmS[16*6+1 +: 15]} + {2'b0, r1r, 8'd0} - {4'b0, pmS[16*12+2 +: 14]};
+    ch_r <= ~y0[17] & y0[16] & ~y1[17] & y1[16];
+    ya = {3'b0, pmS[16*13+1 +: 15]} + {2'b0, r2r, 8'd0};
+    ca_r <= ya[16];
+  end
+  // note: qd values of the *opposite* team are used for the goals: goals_home uses away defense
+  logic [3:0] qaH, qaA;
+  logic [1:0] qdH, qdA;
+  always_comb begin
+    logic [10:0] m1, m2;
+    logic [8:0]  m3, m4;
+    m1 = {5'd0, qaH6} * 11'd43; qaH = m1[10:7];
+    m2 = {5'd0, qaA6} * 11'd43; qaA = m2[10:7];
+    m3 = {5'd0, qdH4} * 9'd43;  qdH = m3[8:7];
+    m4 = {5'd0, qdA4} * 9'd43;  qdA = m4[8:7];
+  end
+  always_ff @(posedge clk) begin
+    gH_r <= (qaH > {2'b0, qdA}) ? qaH - {2'b0, qdA} : 4'd0;
+    gA_r <= (qaA > {2'b0, qdH}) ? qaA - {2'b0, qdH} : 4'd0;
+  end
+  // result select (stage S3, evaluated when the pair beat is loaded)
+  logic [1:0] res_c;
+  logic [8:0] sH_c, sA_c;
+  logic [7:0] g10H, g10A;
+  always_comb begin
+    res_c = ch_r ? 2'd0 : ca_r ? 2'd1 : (gH_r > gA_r) ? 2'd0 : (gH_r < gA_r) ? 2'd1 : 2'd2;
+    g10H = {1'b0, gH_r, 3'b0} + {3'b0, gH_r, 1'b0};
+    g10A = {1'b0, gA_r, 3'b0} + {3'b0, gA_r, 1'b0};
+    sH_c = {1'b0, g10H} + (ch_r ? 9'd150 : 9'd0);
+    sA_c = {1'b0, g10A} + ((ca_r & ~ch_r) ? 9'd150 : 9'd0);
+  end
+  logic [1:0] pres;
+  logic [8:0] psH, psA;
+
+  // =============================================================== Training pipeline
+  logic [15:0] dA, dD, dS;
+  logic        tg, t_ok;
+  always_ff @(posedge clk) begin
+    logic [15:0] a, d, s;
+    logic [17:0] sum;
+    logic [1:0]  ra, rd, rs;
+    logic [15:0] fad, fda, fas, fsa, fds, fsd;
+    a = pmA[15:0]; d = pmD[15:0]; s = pmS[15:0];
+    sum = {2'b0, a} + {2'b0, d} + {2'b0, s};
+    ra = {1'b0, (d < a)} + {1'b0, (s < a)};
+    rd = {1'b0, (a <= d)} + {1'b0, (s < d)};
+    rs = {1'b0, (a <= s)} + {1'b0, (d <= s)};
+    fad = d - a; fda = a - d; fas = s - a; fsa = a - s; fds = s - d; fsd = d - s;
+    // type B : delta(x) = (attribute with next higher rank) - x, 0 for the highest
+    //   attribute A : others D (rank rd) and S (rank rs)
+    case (opt[3:2])
+      2'd0: begin dA <= sum[17:3]; dD <= sum[17:3]; dS <= sum[17:3]; end
+      2'd1: begin
+        dA <= (ra == 2'd2) ? 16'd0 : (rd == ra + 2'd1) ? fad : fas;
+        dD <= (rd == 2'd2) ? 16'd0 : (ra == rd + 2'd1) ? fda : (rs == rd + 2'd1) ? fds : 16'd0;
+        dS <= (rs == 2'd2) ? 16'd0 : (ra == rs + 2'd1) ? fsa : fsd;
+      end
+      2'd2: begin
+        dA <= (a[15:14] == 2'b00) ? {2'b00, ~a[13:0]} : 16'd0;
+        dD <= (d[15:14] == 2'b00) ? {2'b00, ~d[13:0]} : 16'd0;
+        dS <= (s[15:14] == 2'b00) ? {2'b00, ~s[13:0]} : 16'd0;
+      end
+      default: begin
+        dA <= (((~a[15:4]) >= 12'd2047)) ? 16'd5047 : 16'd3000 + {4'b0, ~a[15:4]};
+        dD <= (((~d[15:4]) >= 12'd2047)) ? 16'd5047 : 16'd3000 + {4'b0, ~d[15:4]};
+        dS <= (((~s[15:4]) >= 12'd2047)) ? 16'd5047 : 16'd3000 + {4'b0, ~s[15:4]};
+      end
+    endcase
+  end
+  // T2 (combinational, feeds W_DATA)
+  logic [15:0] nA, nD, nS;
+  logic        tsat_c;
+  always_comb begin
+    logic [17:0] xa, xd, xs;
+    logic [17:0] ea, ed, es;
+    logic        cin;
+    cin = (opt[1:0] == 2'd0);
+    ea = (opt[1:0] == 2'd0) ? ~{4'b0, dA[15:2]} : (opt[1:0] == 2'd2) ? {4'b0, dA[15:2]} : 18'd0;
+    ed = (opt[1:0] == 2'd0) ? ~{4'b0, dD[15:2]} : (opt[1:0] == 2'd2) ? {4'b0, dD[15:2]} : 18'd0;
+    es = (opt[1:0] == 2'd0) ? ~{4'b0, dS[15:2]} : (opt[1:0] == 2'd2) ? {4'b0, dS[15:2]} : 18'd0;
+    xa = {2'b0, pmA[15:0]} + {2'b0, dA} + ea + {17'd0, cin};
+    xd = {2'b0, pmD[15:0]} + {2'b0, dD} + ed + {17'd0, cin};
+    xs = {2'b0, pmS[15:0]} + {2'b0, dS} + es + {17'd0, cin};
+    nA = (|xa[17:16]) ? 16'hFFFF : xa[15:0];
+    nD = (|xd[17:16]) ? 16'hFFFF : xd[15:0];
+    nS = (|xs[17:16]) ? 16'hFFFF : xs[15:0];
+    tsat_c = (|xa[17:16]) | (|xd[17:16]) | (|xs[17:16]);
+  end
+
+  // =============================================================== Match write data path
+  logic [15:0] uA, uD, uS, uE;
+  logic        u_home, u_vld;
+  logic [3:0]  u_cnt;
+  logic        res_ok, rd_all;
+  logic [1:0]  rc;
+  // update of one profile (stage U2)
+  logic [63:0] ud;
+  logic        usat_c;
+  always_comb begin
+    logic win, los;
+    logic [16:0] ra, rd_, rs, re;
+    win = u_home ? (pres == 2'd0) : (pres == 2'd1);
+    los = u_home ? (pres == 2'd1) : (pres == 2'd0);
+    ra  = win ? inc2048(uA) : los ? dec2048(uA) : dec1024(uA);
+    rd_ = win ? inc2048(uD) : los ? dec2048(uD) : dec1024(uD);
+    rs  = win ? inc2048(uS) : los ? dec2048(uS) : dec1024(uS);
+    re  = win ? inc2048(uE) : los ? dec2048(uE) : {1'b0, uE};
+    ud     = {ra[15:0], rd_[15:0], rs[15:0], re[15:0]};
+    usat_c = ra[16] | rd_[16] | rs[16] | re[16];
+  end
+
+  // =============================================================== AW / W / B engines
+  logic        aw_valid;
+  logic [1:0]  aw_id;
+  logic [16:0] aw_addr;
+  logic [3:0]  wbusy;
+  logic        w_valid;
+  logic [63:0] wd;
+  logic [4:0]  wi, wcnt, ahs, bcnt;
+  logic        aw_en, bld_ok, sat_acc;
+
+  wire  [3:0]  wfree_now = ~wbusy | ({4{inf.B_VALID}} & (4'b0001 << inf.B_ID));
+  wire         w_any     = |wfree_now;
+  wire  [1:0]  w_newid   = wfree_now[0] ? 2'd0 : wfree_now[1] ? 2'd1 : wfree_now[2] ? 2'd2 : 2'd3;
+  wire  [3:0]  wj        = wi[3:0] - 4'd1;
+  logic [16:0] aw_addr_n;
+  always_comb begin
+    case (act)
+      A_BUILD: aw_addr_n = {1'b1, 5'd0, 1'b1, 1'b0, 1'b1, 2'b00, tm1, 4'd0};
+      A_TRAIN: aw_addr_n = {7'b1000000, tm1, nib(cH, opt[6:4]), 4'd0};
+      default: begin
+        if (wi == 5'd0) aw_addr_n = {1'b1, 4'd0, 1'b1, 3'd0, pairidx(tm1, tm2), 4'd0};
+        else if (wj < 4'd7) aw_addr_n = {7'b1000000, tm1, nib(cH, wj[2:0]), 4'd0};
+        else aw_addr_n = {7'b1000000, tm2, nib(cA, wj[2:0] + 3'd1), 4'd0};
+      end
+    endcase
+  end
+  wire exp_ok_c  = (opt[1:0] == 2'd0) ? (|inf.R_DATA[79:75]) :
+                   (opt[1:0] == 2'd1) ? (|inf.R_DATA[79:77]) : (|inf.R_DATA[79:78]);
+  wire ev_f4 = bsh[4];
+  wire aw_en_now = (act == A_BUILD) ? (ev_f4 & bld_valid_c) :
+                   (act == A_TRAIN) ? (land_prof & exp_ok_c) :
+                   (act == A_MATCH) ? drained_now : 1'b0;
+  wire aw_load = run & (aw_en | aw_en_now) & (~aw_valid | inf.AW_READY) & (wi < nwr) & w_any;
+  wire ahs_now = inf.AW_VALID & inf.AW_READY;
+  wire aw_cov   = (ahs > wcnt) | (ahs_now & (ahs == wcnt));
+  logic beat_rdy;
+  always_comb begin
+    case (act)
+      A_BUILD: beat_rdy = bld_ok;
+      A_TRAIN: beat_rdy = t_ok;
+      default: beat_rdy = (wcnt == 5'd0) ? res_ok : u_vld;
+    endcase
+  end
+  wire w_load = run & beat_rdy & (~w_valid | inf.W_READY) & aw_cov & (wcnt < nwr);
+  wire u_take = w_load & (act == A_MATCH) & (wcnt != 5'd0);       // U2 consumes the staged profile
+  wire u_fire = rd_all & (act == A_MATCH) & (u_cnt < 4'd14) & (~u_vld | u_take);
+
+  logic [63:0] wd_n;
+  logic        sat_n;
+  always_comb begin
+    sat_n = 1'b0;
+    case (act)
+      A_BUILD: wd_n = {rK, rC0, rC1, rC2, rB0, rB1, rS, 36'd0};
+      A_TRAIN: begin wd_n = {nA, nD, nS, pmE[15:0]}; sat_n = tsat_c; end
+      default: begin
+        if (wcnt == 5'd0) wd_n = {res_c, month, day, sH_c, sA_c, 35'd0};
+        else begin wd_n = ud; sat_n = usat_c; end
+      end
+    endcase
+  end
+
+  wire b_last = inf.B_VALID & (bcnt == nwr - 5'd1);
+
+  // =============================================================== events
+  wire ev_exp    = run & (act == A_TRAIN) & land_prof & ~exp_ok_c;
+  wire ev_roster = run & (act == A_BUILD) & ev_f4 & ~bld_valid_c;
+  wire ev_q      = run & (act == A_QUERY) & qg2;
+  wire ev_done   = run & b_last;
+
+  // Query computation (stage Q2)
+  logic [9:0] qraw, qraw2, qdel;
+  logic       q_ok;
+  always_comb begin
+    logic neg;
+    qraw  = {1'b0, doy_t} - {1'b0, rec_doy};
+    qraw2 = d365_r - {1'b0, rec_doy};
+    neg   = ({1'b0, rec_doy} > {1'b0, doy_t});
+    qdel  = neg ? qraw2 : qraw;
+    q_ok  = (({1'b0, rec_doy} <= {1'b0, doy_t}) & ($signed({1'b0, rec_doy}) >= $signed(lo_r))) |
+            ({1'b0, rec_doy} >= wr_r);
+  end
+
+  // =============================================================== main sequential block
+  always_ff @(posedge clk or negedge inf.rst_n) begin
+    if (!inf.rst_n) begin
+      run <= 1'b0; ri <= '0; rl <= '0; ar_valid <= 1'b0; ar_id <= '0; ar_addr <= '0; rbusy <= '0; rtag <= '0;
+      rbeat <= '0; rdy <= 1'b0; cH <= '0; cA <= '0; hH <= 1'b0; hA <= 1'b0;
+      pmA <= '0; pmD <= '0; pmS <= '0; pmE <= '0;
+      pr_res <= '0; pr_mon <= '0; pr_day <= '0; pr_sh <= '0; pr_sa <= '0; qg <= 1'b0; qg2 <= 1'b0; rec_doy <= '0;
+      bc_a <= '0; bc_d <= '0; bc_s <= '0; bc_pid <= '0; bc_vld <= 1'b0; bsh <= '0;
+      ld_v <= '0; ld_val <= '0; ld_id <= '0; ls_v <= '0; ls_val <= '0; ls_id <= '0; la_v <= '0; la_val <= '0; la_id <= '0;
+      tg <= 1'b0; t_ok <= 1'b0; pres <= '0; psH <= '0; psA <= '0;
+      uA <= '0; uD <= '0; uS <= '0; uE <= '0; u_home <= 1'b0; u_vld <= 1'b0; u_cnt <= '0; res_ok <= 1'b0; rd_all <= 1'b0; rc <= '0;
+      aw_valid <= 1'b0; aw_id <= '0; aw_addr <= '0; wbusy <= '0; w_valid <= 1'b0; wd <= '0;
+      wi <= '0; wcnt <= '0; ahs <= '0; bcnt <= '0; aw_en <= 1'b0; bld_ok <= 1'b0; sat_acc <= 1'b0;
+      inf.out_valid <= 1'b0; inf.complete <= 1'b0; inf.warn_msg <= '0; inf.out_info <= '0;
+    end else begin
+      rdy <= 1'b1;
+      inf.out_valid <= 1'b0; inf.complete <= 1'b0; inf.warn_msg <= '0; inf.out_info <= '0;
+
+      // ------------------------------------------------ start of a command
+      if (start) begin
+        run <= 1'b1; ri <= 5'd1; rl <= '0; hH <= 1'b0; hA <= 1'b0;
+        qg <= 1'b0; qg2 <= 1'b0; bsh <= '0; bc_vld <= 1'b0;
+        ld_v <= '0; ls_v <= '0; la_v <= '0;
+        tg <= 1'b0; t_ok <= 1'b0; u_vld <= 1'b0; u_cnt <= '0; res_ok <= 1'b0; rd_all <= 1'b0; rc <= '0;
+        wi <= '0; wcnt <= '0; ahs <= '0; bcnt <= '0; aw_en <= 1'b0; bld_ok <= 1'b0; sat_acc <= 1'b0;
+        rbeat <= '0;
+      end
+
+      // ------------------------------------------------ AR channel
+      if (ar_valid & inf.AR_READY) ar_valid <= 1'b0;
+      if (start) begin
+        ar_valid <= 1'b1; ar_id <= 2'd0; ar_addr <= addr0; rbusy[0] <= 1'b1; rtag[4:0] <= 5'd0;
+      end else if (ar_load_run) begin
+        ar_valid <= 1'b1; ar_id <= r_newid; ar_addr <= addr_run; ri <= ri + 5'd1;
+        rtag[5*r_newid +: 5] <= ri;
+      end
+      // busy bits : set on load, cleared by R_LAST (set wins when the same ID is re-used)
+      if (r_last) rbusy[inf.R_ID] <= 1'b0;
+      if (start) rbusy[0] <= 1'b1;
+      else if (ar_load_run) rbusy[r_newid] <= 1'b1;
+
+      // ------------------------------------------------ R channel / landing
+      if (inf.R_VALID) rbeat <= inf.R_LAST ? 2'd0 : rbeat + 2'd1;
+      if (r_last) rl <= rl + 5'd1;
+      if (land_ctxH) begin cH <= inf.R_DATA[127:100]; hH <= 1'b1; end
+      if (land_ctxA) begin cA <= inf.R_DATA[127:100]; hA <= 1'b1; end
+      if (land_prof) begin
+        for (int e = 0; e < 14; e++) begin
+          if (ent == e[3:0]) begin
+            pmA[16*e +: 16] <= inf.R_DATA[127:112]; pmD[16*e +: 16] <= inf.R_DATA[111:96];
+            pmS[16*e +: 16] <= inf.R_DATA[95:80];   pmE[16*e +: 16] <= inf.R_DATA[79:64];
+          end
+        end
+      end
+      if (land_pair) begin
+        pr_res <= inf.R_DATA[127:126]; pr_mon <= inf.R_DATA[125:122]; pr_day <= inf.R_DATA[121:117];
+        pr_sh <= inf.R_DATA[116:108]; pr_sa <= inf.R_DATA[107:99];
+      end
+      if (drained_now) rd_all <= 1'b1;
+
+      // ------------------------------------------------ Build : capture, insert, finalise
+      bc_vld <= land_bld;
+      if (land_bld) begin
+        bc_a <= inf.R_DATA[127:112]; bc_d <= inf.R_DATA[111:96]; bc_s <= inf.R_DATA[95:80];
+        bc_pid <= {rtag_cur[1:0], rbeat};
+      end
+      if (bc_vld) begin
+        ld_v <= ld_v_n; ld_val <= ld_val_n; ld_id <= ld_id_n;
+        ls_v <= ls_v_n; ls_val <= ls_val_n; ls_id <= ls_id_n;
+        la_v <= la_v_n; la_val <= la_val_n; la_id <= la_id_n;
+      end
+      bsh <= {bsh[3:0], drained_now & (act == A_BUILD)};
+      if (ev_f4 & bld_valid_c) bld_ok <= 1'b1;
+
+      // ------------------------------------------------ Training / Query / Match flags
+      tg   <= land_prof & (act == A_TRAIN) & exp_ok_c;
+      if (tg) t_ok <= 1'b1;
+      qg   <= land_pair;
+      qg2  <= qg;
+      rec_doy <= doy_f(pr_mon, pr_day);
+      if (drained_now & (act == A_MATCH)) rc <= (rtag_cur == 5'd15) ? 2'd1 : 2'd2;
+      else if (rc != 2'd0) rc <= rc - 2'd1;
+      if (rc == 2'd1) res_ok <= 1'b1;
+
+      // ------------------------------------------------ Match write data pipeline
+      if (u_fire) begin
+        uA <= pmA[16*u_cnt +: 16]; uD <= pmD[16*u_cnt +: 16]; uS <= pmS[16*u_cnt +: 16]; uE <= pmE[16*u_cnt +: 16];
+        u_home <= (u_cnt < 4'd7); u_cnt <= u_cnt + 4'd1; u_vld <= 1'b1;
+      end else if (u_take) u_vld <= 1'b0;
+
+      // ------------------------------------------------ AW channel
+      if (ahs_now) begin aw_valid <= 1'b0; ahs <= ahs + 5'd1; end
+      if (aw_load) begin
+        aw_valid <= 1'b1; aw_id <= w_newid; aw_addr <= aw_addr_n; wi <= wi + 5'd1;
+      end
+      if (aw_en_now) aw_en <= 1'b1;
+      if (inf.B_VALID) wbusy[inf.B_ID] <= 1'b0;
+      if (aw_load) wbusy[w_newid] <= 1'b1;
+      if (inf.B_VALID) bcnt <= bcnt + 5'd1;
+
+      // ------------------------------------------------ W channel
+      if (w_valid & inf.W_READY) w_valid <= 1'b0;
+      if (w_load) begin
+        w_valid <= 1'b1; wd <= wd_n; wcnt <= wcnt + 5'd1;
+        if (sat_n) sat_acc <= 1'b1;
+        if (act == A_MATCH && wcnt == 5'd0) begin pres <= res_c; psH <= sH_c; psA <= sA_c; end
+      end
+
+      // ------------------------------------------------ results
+      if (early) begin
+        inf.out_valid <= 1'b1; inf.warn_msg <= early_opt ? W_OPT : W_TEAM;
+      end
+      if (ev_exp) begin inf.out_valid <= 1'b1; inf.warn_msg <= W_EXP; run <= 1'b0; end
+      if (ev_roster) begin inf.out_valid <= 1'b1; inf.warn_msg <= W_ROSTER; run <= 1'b0; end
+      if (ev_q) begin
+        run <= 1'b0; inf.out_valid <= 1'b1;
+        if (q_ok) begin
+          inf.complete <= 1'b1;
+          inf.out_info <= {month, day, pr_mon, pr_day, qdel[6:0], pr_res, pr_sh, pr_sa, 83'd0};
+        end else inf.warn_msg <= W_DATE;
+      end
+      if (ev_done) begin
+        run <= 1'b0; inf.out_valid <= 1'b1; inf.complete <= 1'b1;
+        inf.warn_msg <= sat_acc ? W_SAT : W_NONE;
+        inf.out_info <= (act == A_MATCH) ? {pres, month, day, psH, psA, 99'd0} : {wd, 64'd0};
+      end
+    end
+  end
+
+  // =============================================================== constant / registered AXI outputs
+  assign inf.AR_VALID = ar_valid;
+  assign inf.AR_ID    = ar_id;
+  assign inf.AR_ADDR  = ar_addr;
+  assign inf.AR_LEN   = {6'd0, (act == A_BUILD), (act == A_BUILD)};
+  assign inf.AR_SIZE  = 3'b100;
+  assign inf.AR_BURST = 2'b01;
+  assign inf.R_READY  = rdy;
+  assign inf.AW_VALID = aw_valid;
+  assign inf.AW_ID    = aw_id;
+  assign inf.AW_ADDR  = aw_addr;
+  assign inf.AW_LEN   = 8'd0;
+  assign inf.AW_SIZE  = 3'b100;
+  assign inf.AW_BURST = 2'b01;
+  assign inf.W_VALID  = w_valid;
+  assign inf.W_DATA   = {wd, 64'd0};
+  assign inf.W_STRB   = 16'hFFFF;
+  assign inf.W_LAST   = 1'b1;
+  assign inf.B_READY  = rdy;
+endmodule
