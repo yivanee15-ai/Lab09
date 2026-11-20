@@ -12,6 +12,7 @@ module pseudo_DRAM (input logic clk, INF.DRAM inf);
   int DRAM_REORDER     = 0;
   int DRAM_SEED        = 0;
   int trace            = 0;
+  int DRAM_RANDRDY     = 0;   // 1: AR/AW/W READY toggle randomly every cycle (independent of VALID)
   string dram_file     = "dram.dat";
 
   logic [7:0] mem [0:131071];
@@ -73,6 +74,7 @@ module pseudo_DRAM (input logic clk, INF.DRAM inf);
     void'($value$plusargs("DRAM_SEED=%d", DRAM_SEED));
     void'($value$plusargs("DRAM_FILE=%s", dram_file));
     void'($value$plusargs("TRACE=%d", trace));
+    void'($value$plusargs("DRAM_RANDRDY=%d", DRAM_RANDRDY));
     $readmemh(dram_file, mem);
     rs = 32'h2545F491 ^ (DRAM_SEED * 32'h9E3779B1);
     if (rs == 0) rs = 1;
@@ -122,7 +124,7 @@ module pseudo_DRAM (input logic clk, INF.DRAM inf);
         end else w_beat++;
         w_wait = rnd() % (DRAM_W_STALL + 1);
       end else if (!inf.W_READY && inf.W_VALID && w_wait > 0) w_wait--;
-      inf.W_READY <= (w_wait == 0);
+      inf.W_READY <= DRAM_RANDRDY ? ((rnd() % (DRAM_W_STALL + 1)) == 0) : (w_wait == 0);
 
       if (trace) begin
         if (inf.AW_VALID && inf.AW_READY) $display("[%0d] AW id%0d addr %h len %0d", cyc, inf.AW_ID, inf.AW_ADDR, inf.AW_LEN);
@@ -146,7 +148,7 @@ module pseudo_DRAM (input logic clk, INF.DRAM inf);
         awq[awq_n] = inf.AW_ID; awq_n++; nwr++;
         aw_wait = rnd() % (DRAM_AR_AW_STALL + 1);
       end else if (!inf.AW_READY && inf.AW_VALID && aw_wait > 0) aw_wait--;
-      inf.AW_READY <= (aw_wait == 0);
+      inf.AW_READY <= DRAM_RANDRDY ? ((rnd() % (DRAM_AR_AW_STALL + 1)) == 0) : (aw_wait == 0);
 
       // ---------- AR capture
       if (inf.AR_VALID && inf.AR_READY) begin
@@ -160,7 +162,7 @@ module pseudo_DRAM (input logic clk, INF.DRAM inf);
         nrd++;
         ar_wait = rnd() % (DRAM_AR_AW_STALL + 1);
       end else if (!inf.AR_READY && inf.AR_VALID && ar_wait > 0) ar_wait--;
-      inf.AR_READY <= (ar_wait == 0);
+      inf.AR_READY <= DRAM_RANDRDY ? ((rnd() % (DRAM_AR_AW_STALL + 1)) == 0) : (ar_wait == 0);
 
       // ---------- R channel
       if (r_busy && inf.R_VALID && inf.R_READY) begin

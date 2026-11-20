@@ -170,4 +170,5 @@ def main():
     print("seed %d: %d cmds" % (seed, len(cmds)), " ".join("%s/w%d=%d" % (k[0], k[1], v) for k, v in sorted(stats.items())))
 
 
-main()
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+##### v1
+[regress 12 seeds x 4 DRAM configs]
+--- runs: 48  PASS: 48  not-pass: 0
+[fuzz]
+--- fuzz runs: 60  PASS: 60  of 60
+[directed]
+RESULT   PASS errors=0 cmds=16 total_latency=299 avg=18.69 max=50 | build=145/5 train=34/4 match=101/3 query=19/4
+[bench]
+min  PASS total_latency=25660 (avg 25.66/cmd)  build 29.0  train 13.1  match 47.4  query 5.5
+mid  PASS total_latency=53303 (avg 53.30/cmd)  build 41.6  train 27.0  match 109.7  query 10.4
+max  PASS total_latency=322521 (avg 322.52/cmd)  build 201.1  train 165.1  match 691.7  query 60.7
+[synth]

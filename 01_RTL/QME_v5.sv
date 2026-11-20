@@ -168,7 +168,10 @@ module QME (input logic clk, INF.QME inf);
                                  {1'b1, 5'd0, 1'b1, 1'b0, 1'b1, 2'b00, tm1, 4'd0};
 
   wire ar_base     = run & (ri < nrd) & (~ar_valid | inf.AR_READY) & r_any;
-  wire ar_load_run = ar_base & dep_reg;
+  // the first profile read right behind the context beat that lands now (Training, Match Home slot 0)
+  wire ld_byp      = ar_base & ~dep_reg & l_ctxH & (is_train | (is_match & (ri == 5'd2)));
+  wire [3:0] pid_byp = is_train ? nib(inf.R_DATA[127:100], opt[6:4]) : inf.R_DATA[127:124];
+  wire ar_load_run = (ar_base & dep_reg) | ld_byp;
 
   // =============================================================== storage
   // pm : unified scratch store, 14 entries x 64 bit.  Entry layout (MSB..LSB) {A, D, S, E} of a profile beat.
@@ -226,21 +229,21 @@ module QME (input logic clk, INF.QME inf);
   logic [6:0]  la_b;  logic [6:0]  la_v_n;  logic [111:0] la_val_n; logic [27:0] la_id_n;
   always_comb begin
     for (int i = 0; i < 4; i++)
-      ld_b[i] = ins_d & (~ld_v[i] | (bc_d > ld_val[16*i +: 16]) | ((bc_d == ld_val[16*i +: 16]) & (bc_pid < ld_id[4*i +: 4])));
+      ld_b[i] = ins_d & (~ld_v[i] | ({bc_d, ~bc_pid} > {ld_val[16*i +: 16], ~ld_id[4*i +: 4]}));   // larger value, or equal value and smaller id
     for (int i = 0; i < 4; i++) begin
       if (!ld_b[i]) begin ld_v_n[i] = ld_v[i]; ld_val_n[16*i +: 16] = ld_val[16*i +: 16]; ld_id_n[4*i +: 4] = ld_id[4*i +: 4]; end
       else if (i == 0 || !ld_b[(i == 0) ? 0 : i - 1]) begin ld_v_n[i] = 1'b1; ld_val_n[16*i +: 16] = bc_d; ld_id_n[4*i +: 4] = bc_pid; end
       else begin ld_v_n[i] = ld_v[(i == 0) ? 0 : i - 1]; ld_val_n[16*i +: 16] = ld_val[16*((i == 0) ? 0 : i - 1) +: 16]; ld_id_n[4*i +: 4] = ld_id[4*((i == 0) ? 0 : i - 1) +: 4]; end
     end
     for (int i = 0; i < 2; i++)
-      ls_b[i] = ins_s & (~ls_v[i] | (bc_s > ls_val[16*i +: 16]) | ((bc_s == ls_val[16*i +: 16]) & (bc_pid < ls_id[4*i +: 4])));
+      ls_b[i] = ins_s & (~ls_v[i] | ({bc_s, ~bc_pid} > {ls_val[16*i +: 16], ~ls_id[4*i +: 4]}));
     for (int i = 0; i < 2; i++) begin
       if (!ls_b[i]) begin ls_v_n[i] = ls_v[i]; ls_val_n[16*i +: 16] = ls_val[16*i +: 16]; ls_id_n[4*i +: 4] = ls_id[4*i +: 4]; end
       else if (i == 0 || !ls_b[(i == 0) ? 0 : i - 1]) begin ls_v_n[i] = 1'b1; ls_val_n[16*i +: 16] = bc_s; ls_id_n[4*i +: 4] = bc_pid; end
       else begin ls_v_n[i] = ls_v[(i == 0) ? 0 : i - 1]; ls_val_n[16*i +: 16] = ls_val[16*((i == 0) ? 0 : i - 1) +: 16]; ls_id_n[4*i +: 4] = ls_id[4*((i == 0) ? 0 : i - 1) +: 4]; end
     end
     for (int i = 0; i < 7; i++)
-      la_b[i] = ins_a & (~la_v[i] | (bc_a > la_val[16*i +: 16]) | ((bc_a == la_val[16*i +: 16]) & (bc_pid < la_id[4*i +: 4])));
+      la_b[i] = ins_a & (~la_v[i] | ({bc_a, ~bc_pid} > {la_val[16*i +: 16], ~la_id[4*i +: 4]}));
     for (int i = 0; i < 7; i++) begin
       if (!la_b[i]) begin la_v_n[i] = la_v[i]; la_val_n[16*i +: 16] = la_val[16*i +: 16]; la_id_n[4*i +: 4] = la_id[4*i +: 4]; end
       else if (i == 0 || !la_b[(i == 0) ? 0 : i - 1]) begin la_v_n[i] = 1'b1; la_val_n[16*i +: 16] = bc_a; la_id_n[4*i +: 4] = bc_pid; end
@@ -263,7 +266,7 @@ module QME (input logic clk, INF.QME inf);
     eq    = (ld_id[3:0] == ls_id[3:0]);
     o1    = ls_v[1];
     o2    = ld_v[1];
-    pick1 = o1 & (~o2 | (t1r > t2r) | ((t1r == t2r) & (ld_id[3:0] < ld_id[7:4])));
+    pick1 = o1 & (~o2 | ({t1r, ~ld_id[3:0]} > {t2r, ~ld_id[7:4]}));
     ksok_n = ld_v[0] & ls_v[0] & (~eq | o1 | o2);
     if (!eq) begin rK_n = ld_id[3:0]; rS_n = ls_id[3:0]; end
     else if (pick1) begin rK_n = ld_id[3:0]; rS_n = ls_id[7:4]; end
@@ -615,7 +618,7 @@ module QME (input logic clk, INF.QME inf);
       if (start) begin
         ar_valid <= 1'b1; ar_id <= 2'd0; ar_addr <= addr0;
       end else if (ar_load_run) begin
-        ar_valid <= 1'b1; ar_id <= r_newid; ar_addr <= addr_reg;
+        ar_valid <= 1'b1; ar_id <= r_newid; ar_addr <= ld_byp ? {7'b1000000, tm1, pid_byp, 4'd0} : addr_reg;
       end
       if (ar_load_run) begin          // never true in the cycle of 'start' (run is still 0)
         ri <= ri + 5'd1;
