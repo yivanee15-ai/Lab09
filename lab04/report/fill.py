@@ -219,7 +219,6 @@ chain(P[32], [
  "學到：mIoU 對每個類別等權，因此 pixel accuracy 高不代表分割好；M1→M4 pixel acc 下降 0.035 但 mIoU 上升 0.024。",
  "失敗的嘗試：（最大的一個）把 class weight + Dice 放進自己設計的 U-Net，預期能改善小類別，但 Model Study 顯示加權 CE 讓 mIoU 下降，U-Net（40 epoch 0.6025）低於 M3（0.6393），最後改交 M3 配置。另外預期把 label 的 BILINEAR 改成 NEAREST 會改善稀有類別，但 M1 與 diag_TA 的 mIoU 沒有可量測的差異（−0.0044）；資料問題確實存在（0.94% 像素 id 無效），但在此設定下影響小。另一個教訓是流程上的：Kaggle 互動式 session 重啟後 /kaggle/working 被清空，所有實驗結果與 ckpt 消失，只能重新執行；之後改以 Save Version 並立即下載輸出。",
  "若有 10× 算力：每個實驗跑多個 seed 以估計雜訊並以均值比較；補跑 FCN 長訓練以分離架構與訓練長度的貢獻；做多尺度訓練與 flip 測試時增強；系統化搜尋 loss 權重與 Dice 係數。",
- ("【依實際情況修改】主要困難：平台排隊與 session 遺失、時間壓力。", PH),
 ])
 
 # ---- AI-use log -----------------------------------------------------------------------
