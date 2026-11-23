@@ -19,6 +19,28 @@ RES = {
 }
 f4 = lambda x: f"{x:.4f}"
 
+LOG = '''R1_photometric（weighted CE + 光度增強，40 epochs，seed 0）
+ep   0  train 1.671  val CE 1.393  mIoU 0.2168  pixacc 0.4914  best(miou) 0.2168@0
+ep   5  train 0.923  val CE 0.800  mIoU 0.4052  pixacc 0.7037  best(miou) 0.4052@5
+ep  10  train 0.727  val CE 0.631  mIoU 0.4846  pixacc 0.7698  best(miou) 0.4846@10
+ep  15  train 0.579  val CE 1.037  mIoU 0.3738  pixacc 0.6811  best(miou) 0.4996@13
+ep  20  train 0.499  val CE 0.508  mIoU 0.5440  pixacc 0.8223  best(miou) 0.5477@16
+ep  25  train 0.444  val CE 0.563  mIoU 0.5563  pixacc 0.8131  best(miou) 0.5709@24
+ep  30  train 0.404  val CE 0.453  mIoU 0.5753  pixacc 0.8371  best(miou) 0.5853@29
+ep  35  train 0.383  val CE 0.426  mIoU 0.5887  pixacc 0.8477  best(miou) 0.5887@35
+ep  39  train 0.377  val CE 0.438  mIoU 0.5854  pixacc 0.8440  best(miou) 0.5887@35
+--> R1_photometric: val mIoU 0.5887  pixel acc 0.8477  (epoch 35)
+R2_dice（weighted CE + Dice 0.5 + 光度增強，40 epochs，seed 0）
+ep   0  train 2.013  val CE 1.157  mIoU 0.3076  pixacc 0.5828  best(miou) 0.3076@0
+ep   5  train 1.199  val CE 0.903  mIoU 0.4060  pixacc 0.7013  best(miou) 0.4060@5
+ep  10  train 0.959  val CE 0.710  mIoU 0.4558  pixacc 0.7613  best(miou) 0.4955@8
+ep  15  train 0.802  val CE 0.693  mIoU 0.4628  pixacc 0.7705  best(miou) 0.5249@14
+ep  20  train 0.705  val CE 0.453  mIoU 0.5670  pixacc 0.8439  best(miou) 0.5670@20
+ep  25  train 0.629  val CE 0.488  mIoU 0.5687  pixacc 0.8349  best(miou) 0.5776@24
+ep  30  train 0.579  val CE 0.438  mIoU 0.5869  pixacc 0.8509  best(miou) 0.5956@29
+ep  35  train 0.552  val CE 0.404  mIoU 0.6042  pixacc 0.8625  best(miou) 0.6042@35
+ep  39  train 0.543  val CE 0.420  mIoU 0.5999  pixacc 0.8571  best(miou) 0.6042@35
+--> R2_dice: val mIoU 0.6042  pixel acc 0.8625  (epoch 35)'''
 d = docx.Document("tpl.docx")
 P = list(d.paragraphs)           # snapshot of template paragraphs (indices from the inspection)
 T = d.tables
@@ -53,6 +75,17 @@ def setcell(cell, text, size=8, bold=False):
     r = p.add_run(text); r.font.size = Pt(size); r.bold = bold
     for extra in cell.paragraphs[1:]: extra._p.getparent().remove(extra._p)
 
+def pic(par, path, w, cap=None):
+    p = after(par, "")
+    p.add_run().add_picture(path, width=Cm(w))
+    p.alignment = 1
+    p.paragraph_format.space_after = Pt(0)
+    if cap:
+        p = after(p, cap, size=8.5)
+        p.alignment = 1
+        p.paragraph_format.space_after = Pt(2)
+    return p
+from docx.shared import Cm
 # ---- header table -------------------------------------------------------------------
 setcell(T[0].rows[0].cells[0], "Name: 許逸凡", 11); setcell(T[0].rows[0].cells[1], "Student ID: 315505009", 11)
 
@@ -80,7 +113,7 @@ rows = [
   "Lec 5-1：類別不平衡下，CE 的總和被大類別主導；mIoU 對每類等權，小類別拖低 mIoU。",
   "class-weighted CE（M2/M4）、Dice loss（R2）、最終模型使用加權 CE + Dice。"),
  ("2", "baseline 沒有 skip connection，輸出 stride 為 32",
-  "5 次 max-pool，在 1/32 解析度預測後以 bilinear 放大 32 倍；細長的 Pole 寬度僅數個像素，IoU 0.008。（Fig. 3 / Fig. 4：Pole 被預測為何類，待貼圖確認。）",
+  "5 次 max-pool，在 1/32 解析度預測後以 bilinear 放大 32 倍；細長的 Pole 寬度僅數個像素，IoU 0.008。（Fig. 3：Pole 主要被誤判為 Building，其餘為 Tree、Sky。）",
   "Lec 5-2：重複下採樣丟失空間細節；skip / 多尺度特徵融合（FCN-8s、U-Net）可補回高解析度資訊。",
   "M3/M4 加入 FCN-8s 式 skip（stride 16 與 8）；最終模型使用 U-Net（stride 1/2/4/8 skip）。"),
  ("3", "資料增強時 label 以 BILINEAR 縮放，產生不存在的 class id",
@@ -91,11 +124,16 @@ rows = [
 for i, row in enumerate(rows):
     if i + 1 >= len(t1.rows): t1._tbl.append(copy.deepcopy(t1.rows[-1]._tr))
     for j, txt in enumerate(row): setcell(t1.rows[i + 1].cells[j], txt, 8)
-cur = chain(P[8], [
+cur = chain(P[9], [
  ("已檢查但未造成差異：以 pixel accuracy 或 val mIoU 選 epoch，diag_TA 兩者皆選到 epoch 37（mIoU 0.5726），因此不列為問題。", {}),
  ("訓練／驗證曲線（Fig. 1）：diag_TA 的 train loss 0.376、val CE 0.369（訓練時有增強，故 train loss 未必較低）；標籤改乾淨後 M1 train loss 0.253、val CE 0.352，開始出現輕微的泛化差距，val mIoU 約在 epoch 28 之後趨於持平。", {}),
- ("【貼圖】Fig. 1 訓練/驗證曲線　Fig. 2 per-class IoU 與像素頻率　Fig. 3 confusion matrix（row-normalised）　Fig. 4 好/壞案例預測（最好 val #45、#46，mIoU 0.653/0.649；最差 val #8、#6，mIoU 0.182/0.211；場景與錯誤類型請依圖補述）", PH),
+
 ])
+
+cur = pic(cur, "f2.png", 16.0, "Fig. 1  diag_TA（TA 原版）訓練 loss / val CE / val mIoU 曲線")
+cur = pic(cur, "f3.png", 16.0, "Fig. 2 / Fig. 3  per-class IoU（mIoU 0.573）、訓練像素頻率（對數座標）、confusion matrix（row-normalised，diag_TA）")
+cur = pic(cur, "f4.png", 7.0, "Fig. 4  diag_TA 預測：前兩列為最好（val #46、#45，mIoU 0.649 / 0.653），後兩列為最差（val #8、#6，mIoU 0.182 / 0.211）")
+cur = after(cur, "觀察：(a) Fig. 3 的 confusion matrix 顯示 Pole、SignSymbol、Fence、Pedestrian 的真值像素大量被預測成 Building（圖中顏色約 0.3–0.6），其餘為 Tree / Sky；小類別幾乎都被大區域吃掉。(b) Fig. 4 最差的兩張（seqB_0069、seqB_0067）是反光的商店玻璃櫥窗，Building 被預測成 Tree、Fence、Sidewalk 的碎片，細長的柱子（Pole）完全沒有出現；最好的兩張（seqC_0231、seqC_0230）是一般街景，Sky、Road、Building 大致正確，但騎自行車的人被預測成一團。(c) Fig. 1：train loss 與 val CE 都平穩下降並收斂，val mIoU 在 epoch 28 後趨於平坦（約 0.57）。", size=9.5)
 
 # ---- Model study ----------------------------------------------------------------------
 t2 = T[2]
@@ -108,7 +146,9 @@ for i, k in enumerate(["M1", "M2", "M3", "M4"]):
     vals = [f"{v:.3f}" for v in RES[k][0]] if k in RES else [TBD] * 11
     for j, v in enumerate(vals): setcell(t3.rows[i + 1].cells[j + 1], v, 7)
 
-chain(P[17], [("【貼圖】M1–M4 在同一 2 張 val 圖（val #10、#60）上的預測與 ground truth。", PH)])
+c17 = pic(P[17], "f5.png", 16.0, "Fig. 5  M1–M4 的 train loss（各自的目標函數，加權版數值較大不可直接比較）/ val CE（未加權）/ val mIoU 曲線")
+c17 = pic(c17, "f6.png", 16.0, "Fig. 6  M1–M4 在同 2 張 val 圖（seqB_0071 = val #10、seqD_0111 = val #60）的預測，第二欄為 ground truth")
+c17 = after(c17, "觀察：M3 的結果最接近 ground truth，電線桿等細長物體（淺黃色）有部分被保留；M2、M4（加權 CE）在 Building、Tree 區域出現零碎的 SignSymbol / Fence / Pedestrian 小塊（誤報），與 Building IoU 的大幅下降一致；沒有 skip 的 M1、M2 輪廓比較粗糙，Pole 幾乎沒有。", size=9.5)
 chain(P[20], [
  ("預期：skip 讓 Pole、SignSymbol、Fence、Bicyclist 等細長/小物體提升（Lec 5-2：高解析度特徵補回細節），對 Sky、Road 等大區域影響小；class weight 提高小類別 recall，但以犧牲大類別精度（Building、Road 的 FP/FN）與 pixel accuracy 為代價（Lec 5-1：加權 CE 改變各類別的梯度比重）；M4 預期約為兩者效果相加，但可能小於相加（兩者都在修補小類別，效果重疊）。", {}),
  ("已有結果（M1 → M4，seed 0）：mIoU 0.5682 → 0.5923；pixel accuracy 0.8852 → 0.8498（下降）。變化最大的類別：Bicyclist 0.436 → 0.620（+0.184）、Pole 0.014 → 0.124（+0.110）、SignSymbol 0.170 → 0.248（+0.078）、Pedestrian +0.052；代價：Building 0.787 → 0.642（−0.145）、Fence −0.043。這符合加權 CE 以大類別精度換取小類別 recall 的預期。", {}),
@@ -130,8 +170,16 @@ r2 = ["2", "小/細長類別仍然偏低（Task 1 #1）", "mIoU 為各類別 IoU
       f"R1 0.5887 → R2 {f4(RES['R2'][1])}（+0.0155），pixel acc 0.8477 → 0.8625。Fence +0.050、Building +0.045、SignSymbol +0.033、Pedestrian +0.018、Tree +0.014、Bicyclist +0.012、Pole +0.005；Sidewalk −0.004、Sky −0.003。",
       "預測大致成立：+0.0155 約為 seed noise（0.007）的兩倍，且為單一 seed，只能說「很可能是真實改善」。上升最多的是 Fence、Building、SignSymbol（與 Dice 對區域重疊的優化吻合），Pole 只增加 0.005，仍是最大瓶頸。注意 R2（0.6042）仍低於 M3（0.6393，無 class weight 的 skip 模型），顯示 Task 2 以 M4（加權 CE）為起點本身就不是最佳起點。"]
 for i, row in enumerate([r1, r2]):
-    for j, txt in enumerate(row): setcell(t4.rows[i + 1].cells[j], txt, 8)
-chain(P[23], [("【貼圖】R1、R2 的訓練曲線或 log（ckpt/R1_photometric.json、R2_dice.json）。", PH)])
+    for j, txt in enumerate(row): setcell(t4.rows[i + 1].cells[j], txt, 7.5)
+_lg = chain(P[23], [("訓練 log（節錄；train 為各自目標函數的 loss，val CE 為未加權 CE）：", dict(size=9, bold=True))])
+_log_pars = [_lg]
+for _ln in [l for l in LOG.splitlines() if not l.startswith('ep ') or l.split()[1] in ('0','20','39')]:
+    _lg = after(_lg, _ln, size=6.5)
+    _lg.paragraph_format.space_after = Pt(0)
+    for _r in _lg.runs: _r.font.name = "Courier New"
+    _log_pars.append(_lg)
+for _p in _log_pars:            # the log goes below the table (right before the Task 3 heading)
+    P[24]._p.addprevious(_p._p)
 
 # ---- Task 3 ---------------------------------------------------------------------------
 tb = d.add_table(rows=1, cols=4); tb.style = T[2].style
