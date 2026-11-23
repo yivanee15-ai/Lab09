@@ -12,7 +12,8 @@ RES = {
  "M4":   ([.8748, .6423, .1239, .9295, .7489, .7587, .2483, .3679, .8226, .3783, .6199], .5923),
  "R2":   ([.8797, .6972, .1196, .9263, .7614, .7646, .2606, .3984, .8130, .4123, .6133], .6042),
  "T40":  ([.8739, .6410, .1418, .9408, .7952, .7596, .2029, .3828, .8210, .4158, .6855], .6055),
- "T3":   ([.8932, .7645, .2774, .9459, .8059, .7773, .3525, .5471, .8515, .5739, .7960], .6896),
+ "T120": ([.8932, .7645, .2774, .9459, .8059, .7773, .3525, .5471, .8515, .5739, .7960], .6896),
+ "T3":   ([.8792, .6390, .1551, .9343, .7884, .7484, .2053, .3825, .8062, .3952, .6940], .6025),
 }
 f4 = lambda x: f"{x:.4f}"
 
@@ -56,7 +57,7 @@ setcell(T[0].rows[0].cells[0], "Name: 許逸凡", 11); setcell(T[0].rows[0].cell
 # ---- result screenshots ---------------------------------------------------------------
 chain(P[4], [("【貼上截圖：test.py --split test_public 的終端輸出：3 個 [OK]、參數量 4,734,795、wrote 50 predictions】", PH)])
 chain(P[5], [("【貼上截圖：test.py --split val 的 per-class IoU 與 mIoU】", PH),
-             f"（參考：先前一次完整執行的最終模型 val mIoU = {f4(RES['T3'][1])}；本報告提交的 final_model.pth 以最終截圖為準：val mIoU = TBD。）"])
+             f"（提交的 final_model.pth：40 epoch，epoch 37，val mIoU = {f4(RES['T3'][1])}，pixel acc 0.8520；Pole 0.155、SignSymbol 0.205、Pedestrian 0.395、Bicyclist 0.694。）"])
 
 # ---- Task 1 ---------------------------------------------------------------------------
 t1 = T[1]
@@ -129,7 +130,7 @@ for r in rows3:
     for j, v in enumerate(r): setcell(cells[j], v, 8)
 P[26]._p.addnext(tb._tbl)
 chain(P[26], [])  # keep anchor
-cur = after(P[26], "訓練設定：loss = class-weighted CE（w_c = median(f)/f_c，截斷於 [0.2,10]）+ 0.5 × soft-Dice；Adam，lr 1e-3，CosineAnnealing；batch size 8；混合精度 fp16；epochs = TBD（最終提交模型的實際 epoch 數）；augmentation：水平翻轉、隨機縮放 0.75–1.25（crop/pad，label 用 NEAREST）、亮度/對比/飽和度抖動 0.7–1.3；seed 0；以 val mIoU 選 epoch，val 僅用於驗證與選模，未用於訓練，test_public 僅用於產生預測。", hl=False)
+cur = after(P[26], "訓練設定：loss = class-weighted CE（w_c = median(f)/f_c，截斷於 [0.2,10]）+ 0.5 × soft-Dice；Adam，lr 1e-3，CosineAnnealing；batch size 8；混合精度 fp16；epochs = 40（選 val mIoU 最高的 epoch 37）；augmentation：水平翻轉、隨機縮放 0.75–1.25（crop/pad，label 用 NEAREST）、亮度/對比/飽和度抖動 0.7–1.3；seed 0；以 val mIoU 選 epoch，val 僅用於驗證與選模，未用於訓練，test_public 僅用於產生預測。", hl=False)
 # the table must come before the training-settings paragraph: move it
 P[26]._p.addnext(tb._tbl)
 
@@ -140,8 +141,8 @@ chain(P[29], [
  "• 小類別：沿用 Task 2 的加權 CE + Dice 與光度增強（Task 1 #1）。",
  "• 參數預算：通道數取 32/64/128/160/224，總參數 4.73M，留約 5% 餘裕，並使用 Dropout2d 抑制 445 張影像的過擬合。",
  ("證據（val mIoU；除最終模型外，皆為先前一次完整執行、40 epoch 的結果）：", dict(bold=True)),
- f"M1 {f4(RES['M1'][1])} → M4 {f4(RES['M4'][1])} → R2 {f4(RES['R2'][1])}（TA FCN）；同一訓練配方下的 U-Net 40 epoch：{f4(RES['T40'][1])}；U-Net 長訓練（120 epoch，先前執行）：{f4(RES['T3'][1])}；本次提交模型：TBD。",
- "誠實的限制：在相同 40 epoch 下，U-Net（0.6055）與加了 skip 的 FCN R2（0.6042）幾乎相同，差距遠小於可能的 seed noise；較高的最終分數來自更長的訓練，而我沒有跑「FCN 120 epoch」的對照，因此無法把提升分開歸因於架構或訓練長度。",
+ f"M1 {f4(RES['M1'][1])} → M4 {f4(RES['M4'][1])} → R2 {f4(RES['R2'][1])}（TA FCN，40 epoch）；同一配方的 U-Net 40 epoch：先前一次執行 {f4(RES['T40'][1])}，本次重跑（即提交模型）{f4(RES['T3'][1])}；U-Net 120 epoch（先前一次執行，檔案已遺失，未提交）：{f4(RES['T120'][1])}。",
+ "誠實的限制：在相同 40 epoch 下，U-Net（兩次執行 0.6055、0.6025）與加了 skip 的 FCN R2（0.6042）幾乎相同，差距小於兩次 U-Net 執行之間的波動（約 0.003）；因此沒有證據顯示架構本身在 40 epoch 下優於 R2。120 epoch 的 0.6896 顯示更長的訓練有明顯幫助，但那份權重已遺失、未提交，且沒有跑「FCN 120 epoch」的對照，無法把提升分開歸因於架構或訓練長度。提交的是 40 epoch 版本。",
 ])
 
 # ---- Reflections ----------------------------------------------------------------------
