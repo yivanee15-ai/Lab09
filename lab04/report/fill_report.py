@@ -59,7 +59,7 @@ setcell(T[0].rows[0].cells[0], "Name: 許逸凡", 11); setcell(T[0].rows[0].cell
 # ---- result screenshots ---------------------------------------------------------------
 chain(P[4], [("【貼上截圖：test.py --split test_public 的終端輸出：3 個 [OK]、參數量 4,734,795、wrote 50 predictions】", PH)])
 chain(P[5], [("【貼上截圖：test.py --split val 的 per-class IoU 與 mIoU】", PH),
-             f"（提交的 final_model.pth：40 epoch，epoch 37，val mIoU = {f4(RES['T3'][1])}，pixel acc 0.8520；Pole 0.155、SignSymbol 0.205、Pedestrian 0.395、Bicyclist 0.694。）"])
+             f"（提交的 final_model.pth = FCN + skip，一般 CE，40 epoch，epoch 37：val mIoU = 0.6446，pixel acc 0.9026；Pole 0.098、SignSymbol 0.298、Pedestrian 0.484、Bicyclist 0.650。）"])
 
 # ---- Task 1 ---------------------------------------------------------------------------
 t1 = T[1]
@@ -124,11 +124,11 @@ chain(P[23], [("【貼圖】R1、R2 的訓練曲線或 log（ckpt/R1_photometric
 tb = d.add_table(rows=1, cols=4); tb.style = T[2].style
 hdr = ["模組", "結構", "輸出 stride / 通道", "參數量"]
 rows3 = [
- ("Encoder ×5", "ConvBlock（2×[3×3 conv-BN-ReLU]）；前 4 個之後 2×2 max-pool", "1,2,4,8,16；32/64/128/160/224", "1,477,856"),
- ("Context block", "4 個殘差 3×3 dilated conv-BN-ReLU（d = 1,2,4,8），Dropout2d 0.1", "16；224", "1,808,128"),
- ("Decoder up3→up0", "bilinear 上採樣 + concat 對應 encoder 特徵（skip）+ ConvBlock", "8,4,2,1；160/128/64/32", "784,000 + 479,744 + 147,712 + 36,992"),
- ("Classifier", "1×1 conv → 11 類 logits（輸入先於 forward 內 normalize）", "1；11", "363"),
- ("合計", "UNetCtx，輸出 [B,11,360,480]", "—", "4,734,795（≤ 5,000,000）"),
+ ("Encoder ×5", "ConvBlock（2×[3×3 conv-BN-ReLU]）+ 2×2 max-pool；forward 內先 (x−0.5)/0.5 normalize", "2,4,8,16,32；24/48/96/192/384", "—"),
+ ("Head", "3×3 conv-BN-ReLU（384）→ 1×1 conv → 11 類 logits", "32；11", "—"),
+ ("Skip（FCN-8s 式）", "stride-16（192 ch）與 stride-8（96 ch）特徵各接 1×1 score conv；bilinear 上採樣後逐元素相加（無額外 decoder block）", "16, 8；11", "3,190"),
+ ("輸出", "bilinear 放大至 360×480，輸出 [B,11,360,480] logits", "1；11", "—"),
+ ("合計", "TA encoder + 兩條 skip，輸出 stride 8 後放大", "—", "3,987,945（≤ 5,000,000；encoder + head 為 3,984,755）"),
 ]
 for j, h in enumerate(hdr): setcell(tb.rows[0].cells[j], h, 8, True)
 for r in rows3:
@@ -136,26 +136,27 @@ for r in rows3:
     for j, v in enumerate(r): setcell(cells[j], v, 8)
 P[26]._p.addnext(tb._tbl)
 chain(P[26], [])  # keep anchor
-cur = after(P[26], "訓練設定：loss = class-weighted CE（w_c = median(f)/f_c，截斷於 [0.2,10]）+ 0.5 × soft-Dice；Adam，lr 1e-3，CosineAnnealing；batch size 8；混合精度 fp16；epochs = 40（選 val mIoU 最高的 epoch 37）；augmentation：水平翻轉、隨機縮放 0.75–1.25（crop/pad，label 用 NEAREST）、亮度/對比/飽和度抖動 0.7–1.3；seed 0；以 val mIoU 選 epoch，val 僅用於驗證與選模，未用於訓練，test_public 僅用於產生預測。", hl=False)
+cur = after(P[26], "訓練設定：loss = 一般 cross-entropy（void 忽略，無 class weight、無 Dice）；Adam，lr 1e-3，CosineAnnealing；batch size 8；混合精度 fp16；epochs = 40（選 val mIoU 最高的 epoch 37）；augmentation：水平翻轉、隨機縮放 0.75–1.25（crop/pad，label 用 NEAREST），無光度增強；seed 0；val 僅用於驗證與選模，未用於訓練，test_public 僅用於產生預測。", hl=False)
 # the table must come before the training-settings paragraph: move it
 P[26]._p.addnext(tb._tbl)
 
 chain(P[29], [
- ("設計理由：", dict(bold=True)),
- "• 薄物體（Pole、SignSymbol）：U-Net 的全解析度 skip（stride 1/2/4/8）把高解析度特徵直接接到 decoder，對應 Task 1 #2（stride-32 輸出）。",
- "• 大區域（Sky、Road、Building）：stride-16 的 dilated residual context block（d=1,2,4,8）在不再下採樣的前提下擴大感受野。",
- "• 小類別：沿用 Task 2 的加權 CE + Dice 與光度增強（Task 1 #1）。",
- "• 事後檢討（重要）：Model Study 顯示 class weight 對 mIoU 為負（M2−M1 −0.039、M4−M3 −0.047），而 M3（FCN + skip，一般 CE）達到 val mIoU 0.6393，高於提交的 U-Net（0.6025）。提交的最終模型因此不是我手上最好的配置；這是在時間不足、且 Model Study 結果出來之前就已選定最終配方所致。",
- "• 參數預算：通道數取 32/64/128/160/224，總參數 4.73M，留約 5% 餘裕，並使用 Dropout2d 抑制 445 張影像的過擬合。",
- ("證據（val mIoU；除最終模型外，皆為先前一次完整執行、40 epoch 的結果）：", dict(bold=True)),
- f"M1 {f4(RES['M1'][1])} → M4 {f4(RES['M4'][1])} → R2 {f4(RES['R2'][1])}（TA FCN，40 epoch）；同一配方的 U-Net 40 epoch：先前一次執行 {f4(RES['T40'][1])}，本次重跑（即提交模型）{f4(RES['T3'][1])}；U-Net 120 epoch（先前一次執行，檔案已遺失，未提交）：{f4(RES['T120'][1])}。",
- "誠實的限制：在相同 40 epoch 下，U-Net（兩次執行 0.6055、0.6025）與加了 skip 的 FCN R2（0.6042）幾乎相同，差距小於兩次 U-Net 執行之間的波動（約 0.003）；因此沒有證據顯示架構本身在 40 epoch 下優於 R2。120 epoch 的 0.6896 顯示更長的訓練有明顯幫助，但那份權重已遺失、未提交，且沒有跑「FCN 120 epoch」的對照，無法把提升分開歸因於架構或訓練長度。提交的是 40 epoch 版本。",
+ ("設計理由與證據：", dict(bold=True)),
+ "• 最終模型 = TA baseline 的 encoder + FCN-8s 式 skip（Model Study 的 M3 配置，一般 CE）。它是由實驗結果選出，不是事先設計的複雜架構：M3 在 val mIoU 上是 M1–M4 中最高。",
+ "• 薄物體 / 小類別（Task 1 #2）：skip 把 stride 8/16 的高解析度特徵補回，M3−M1：Bicyclist +0.220、Pedestrian +0.144、SignSymbol +0.110、Fence +0.092、Pole +0.080，遠大於 M1 的 seed noise（mIoU 0.007）。",
+ "• 使用一般 CE：Model Study 顯示 class weight 使 mIoU 下降（M2−M1 −0.039、M4−M3 −0.047），故最終模型不使用。",
+ "• 參數預算：3.99M，低於 5M，且無額外 decoder block（skip 只增加 3,190 個參數）。",
+ ("證據（val mIoU）：", dict(bold=True)),
+ f"M1 {f4(RES['M1'][1])}（seed 1：0.5613）→ M3 {f4(RES['M3'][1])}（skip，+0.071）；提交模型為 M3 配置重新訓練一次：0.6446（與第一次的差 0.005，屬於重訓雜訊範圍）。M2 0.5297、M4 0.5923。",
+ "• 另外嘗試過自己設計的 U-Net + 膨脹卷積 context block（4.73M 參數，加權 CE + Dice + 光度增強）：40 epoch val mIoU 為 0.6055 / 0.6025（兩次執行），低於 M3；先前一次 120 epoch 版本曾達 0.6896，但該權重遺失、未提交，且與 M3 的差異同時包含架構、loss 與訓練長度，無法分離歸因。",
+ ("誠實的限制：", dict(bold=True)),
+ "val 也用於選 epoch，所以 val mIoU 對 public/private test 略為樂觀；沒有實驗比較「M3 訓練 120 epoch」，無法判斷更長的訓練是否也會讓 M3 提升。",
 ])
 
 # ---- Reflections ----------------------------------------------------------------------
 chain(P[32], [
  "學到：mIoU 對每個類別等權，因此 pixel accuracy 高不代表分割好；M1→M4 pixel acc 下降 0.035 但 mIoU 上升 0.024。",
- "失敗的嘗試：（最大的一個）把 class weight + Dice 放進最終模型，預期能改善小類別，但 Model Study 顯示加權 CE 讓 mIoU 下降，而且我在 Model Study 結果出來前就已決定最終配方，導致提交的 U-Net（0.6025）低於 M3（0.6393）。另外預期把 label 的 BILINEAR 改成 NEAREST 會改善稀有類別，但 M1 與 diag_TA 的 mIoU 沒有可量測的差異（−0.0044）；資料問題確實存在（0.94% 像素 id 無效），但在此設定下影響小。另一個教訓是流程上的：Kaggle 互動式 session 重啟後 /kaggle/working 被清空，所有實驗結果與 ckpt 消失，只能重新執行；之後改以 Save Version 並立即下載輸出。",
+ "失敗的嘗試：（最大的一個）把 class weight + Dice 放進自己設計的 U-Net，預期能改善小類別，但 Model Study 顯示加權 CE 讓 mIoU 下降，U-Net（40 epoch 0.6025）低於 M3（0.6393），最後改交 M3 配置。另外預期把 label 的 BILINEAR 改成 NEAREST 會改善稀有類別，但 M1 與 diag_TA 的 mIoU 沒有可量測的差異（−0.0044）；資料問題確實存在（0.94% 像素 id 無效），但在此設定下影響小。另一個教訓是流程上的：Kaggle 互動式 session 重啟後 /kaggle/working 被清空，所有實驗結果與 ckpt 消失，只能重新執行；之後改以 Save Version 並立即下載輸出。",
  "若有 10× 算力：每個實驗跑多個 seed 以估計雜訊並以均值比較；補跑 FCN 長訓練以分離架構與訓練長度的貢獻；做多尺度訓練與 flip 測試時增強；系統化搜尋 loss 權重與 Dice 係數。",
  ("【依實際情況修改】主要困難：平台排隊與 session 遺失、時間壓力。", PH),
 ])
