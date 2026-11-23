@@ -110,12 +110,14 @@ chain(P[20], [
 
 # ---- Task 2 ---------------------------------------------------------------------------
 t4 = T[4]
-r1 = ["1", "小類別與外觀差異（白天/傍晚、僅 445 張）導致泛化差距（Task 1 #1）", "加入亮度/對比/飽和度抖動，增加訓練分佈的多樣性，應降低過擬合並使 val 提升。",
-      "預期 mIoU 小幅提升（約 +0.005 ~ +0.01），主要在 Sky/Building/Tree 等受光線影響的類別。", "TBD（R1_photometric 的 val mIoU 與 per-class 尚未取得）", "TBD"]
+r1 = ["1", "外觀差異（白天/傍晚）與僅 445 張訓練圖造成的泛化差距（Task 1 #1 / train-val 差距）", "加入亮度/對比/飽和度抖動，增加訓練分佈多樣性，應降低過擬合並使 val 提升。",
+      "預期 mIoU 小幅提升（約 +0.005 ~ +0.01），主要在 Sky/Building/Tree 等受光線影響的類別。",
+      "M4 0.5923 → R1 0.5887（−0.0036），pixel acc 0.8498 → 0.8477。Sky +0.007、Building +0.010、Sidewalk +0.016、Pedestrian +0.016；SignSymbol −0.020、Fence −0.019、Bicyclist −0.018、Pole −0.009。",
+      "預測未成立：mIoU 沒有提升（−0.0036，小於 M1 的 seed noise 0.007，視為沒有可量測的差異）。只有受光線影響的大類別（Sky、Building、Sidewalk）小幅上升，但稀有類別（SignSymbol、Fence、Bicyclist）反而下降；可能原因是限制 mIoU 的是稀有類別的特徵與樣本數，而非光照變化，且光度抖動讓本來就少的小物體更難學（此為推測，未另做實驗驗證）。"]
 r2 = ["2", "小/細長類別仍然偏低（Task 1 #1）", "mIoU 為各類別 IoU 的平均，Dice 直接優化區域重疊，對小類別的梯度不會被像素數稀釋，應補強加權 CE 的不足。",
-      "預期 mIoU 再提升約 +0.01，Pole/SignSymbol/Pedestrian 上升。",
-      f"M4 {f4(RES['M4'][1])} → R2 {f4(RES['R2'][1])}（相對 M4 +{RES['R2'][1]-RES['M4'][1]:.4f}，含 R1 的光度增強，R1 單獨數字 TBD）。Pole 0.124→0.120、SignSymbol 0.248→0.261、Pedestrian 0.378→0.412、Fence 0.368→0.398、Building 0.642→0.697；Bicyclist 0.620→0.613。",
-      "TBD（需先取得 R1，才能分開 R1 與 R2 各自的貢獻；M4→R2 的 +0.012 是否大於 seed noise 亦待 M1 seed 1）。"]
+      "預期 mIoU 再提升約 +0.01，Pole / SignSymbol / Pedestrian 上升。",
+      f"R1 0.5887 → R2 {f4(RES['R2'][1])}（+0.0155），pixel acc 0.8477 → 0.8625。Fence +0.050、Building +0.045、SignSymbol +0.033、Pedestrian +0.018、Tree +0.014、Bicyclist +0.012、Pole +0.005；Sidewalk −0.004、Sky −0.003。",
+      "預測大致成立：+0.0155 約為 seed noise（0.007）的兩倍，且為單一 seed，只能說「很可能是真實改善」。上升最多的是 Fence、Building、SignSymbol（與 Dice 對區域重疊的優化吻合），Pole 只增加 0.005，仍是最大瓶頸。注意 R2（0.6042）仍低於 M3（0.6393，無 class weight 的 skip 模型），顯示 Task 2 以 M4（加權 CE）為起點本身就不是最佳起點。"]
 for i, row in enumerate([r1, r2]):
     for j, txt in enumerate(row): setcell(t4.rows[i + 1].cells[j], txt, 8)
 chain(P[23], [("【貼圖】R1、R2 的訓練曲線或 log（ckpt/R1_photometric.json、R2_dice.json）。", PH)])
