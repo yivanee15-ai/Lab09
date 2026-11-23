@@ -29,11 +29,8 @@ def sh(cmd):
     print(p.stdout); return p.returncode
 
 ZIP = "2026_DL_Lab04.zip"
-try:
-    import google.colab; IN_COLAB = True
-except ImportError:
-    IN_COLAB = False
-IN_KAGGLE = os.path.exists("/kaggle/input")
+IN_KAGGLE = os.path.exists("/kaggle/input") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ   # check Kaggle first: it also ships google.colab
+IN_COLAB = (not IN_KAGGLE) and os.path.exists("/var/colab/hostname")                        # only real Colab has this file
 
 if IN_COLAB:
     WORK = "/content/2026_DL_Lab04"; DRIVE_DIR = "/content/drive/MyDrive/DL_Lab04"
